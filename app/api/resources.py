@@ -1,32 +1,33 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Query, status
 
-from app.db.session import get_db
+from app.api.deps import AdminUser, DbSession
 from app.schemas.resource import ResourceCreate, ResourceList, ResourceRead, ResourceUpdate
 from app.services import resource_service
 
 router = APIRouter(prefix="/resources", tags=["resources"])
 
-DbSession = Annotated[Session, Depends(get_db)]
-
+AUTH_RESPONSES = {
+    status.HTTP_401_UNAUTHORIZED: {"description": "로그인하지 않음"},
+    status.HTTP_403_FORBIDDEN: {"description": "관리자가 아님"},
+}
 ERROR_RESPONSES = {
     status.HTTP_404_NOT_FOUND: {"description": "자원이 없음"},
     status.HTTP_409_CONFLICT: {"description": "같은 이름의 자원이 이미 있음"},
 }
 
-# TODO(인증 기능): 등록과 수정은 관리자(ADMIN)만 할 수 있도록 막는다.
+# 조회는 누구나, 등록과 수정은 관리자만 할 수 있다.
 
 
 @router.post(
     "",
     response_model=ResourceRead,
     status_code=status.HTTP_201_CREATED,
-    responses={409: ERROR_RESPONSES[409]},
-    summary="자원 등록",
+    responses={**AUTH_RESPONSES, 409: ERROR_RESPONSES[409]},
+    summary="자원 등록 (관리자)",
 )
-def create_resource(data: ResourceCreate, db: DbSession):
+def create_resource(data: ResourceCreate, db: DbSession, _admin: AdminUser):
     return resource_service.create_resource(db, data)
 
 
@@ -56,9 +57,9 @@ def get_resource(resource_id: int, db: DbSession):
 @router.patch(
     "/{resource_id}",
     response_model=ResourceRead,
-    responses=ERROR_RESPONSES,
-    summary="자원 수정 (비활성화 포함)",
+    responses={**AUTH_RESPONSES, **ERROR_RESPONSES},
+    summary="자원 수정 (관리자, 비활성화 포함)",
     description="보낸 필드만 바꾼다. 자원은 삭제하지 않고 `is_active: false`로 비활성화한다.",
 )
-def update_resource(resource_id: int, data: ResourceUpdate, db: DbSession):
+def update_resource(resource_id: int, data: ResourceUpdate, db: DbSession, _admin: AdminUser):
     return resource_service.update_resource(db, resource_id, data)

@@ -1,5 +1,14 @@
 import pytest
 
+from tests.conftest import auth_header
+
+
+@pytest.fixture
+def client(client, admin):
+    """이 파일의 테스트는 관리자로 로그인한 상태에서 실행한다. (권한 검사는 test_auth.py)"""
+    client.headers.update(auth_header(admin))
+    return client
+
 
 def create(client, **overrides):
     body = {"name": "회의실 A", "capacity": 6} | overrides

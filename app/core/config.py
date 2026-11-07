@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
@@ -14,6 +15,13 @@ class Settings(BaseSettings):
     db_name: str = "reservation"
     db_user: str = "reservation_app"
     db_password: str = ""
+
+    # JWT 서명 키. 기본값을 두지 않는다: 설정을 빠뜨리면 약한 키로 조용히 도는 대신
+    # 앱이 시작부터 실패하게 해서 바로 알아차리게 한다.
+    # SecretStr: 로그나 오류 메시지에 값이 찍혀도 '**********'로 가려진다.
+    jwt_secret_key: SecretStr
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
 
     @property
     def database_url(self) -> URL:

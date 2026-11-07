@@ -17,6 +17,18 @@ class AppError(Exception):
         self.detail = detail
 
 
+class UnauthorizedError(AppError):
+    """인증 실패 (로그인 안 함, 토큰이 잘못됨, 비밀번호 틀림)."""
+
+    status_code = 401
+
+
+class ForbiddenError(AppError):
+    """인증은 됐지만 권한이 없음 (예: 일반 사용자가 관리자 기능 호출)."""
+
+    status_code = 403
+
+
 class NotFoundError(AppError):
     status_code = 404
 
@@ -29,4 +41,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
         # FastAPI 기본 오류 응답과 같은 {"detail": ...} 형식을 쓴다.
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        headers = None
+        if isinstance(exc, UnauthorizedError):
+            # 401 응답에는 어떤 방식으로 인증해야 하는지 알려 주는 헤더를 붙인다. (HTTP 표준)
+            headers = {"WWW-Authenticate": "Bearer"}
+        return JSONResponse(
+            status_code=exc.status_code, content={"detail": exc.detail}, headers=headers
+        )

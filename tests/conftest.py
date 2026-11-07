@@ -6,6 +6,8 @@ from pathlib import Path
 # 설정(get_settings)과 엔진은 import 시점에 한 번 만들어지기 때문이다.
 # 환경 변수는 .env보다 우선하므로 .env의 DB_NAME(개발용 DB)을 덮어쓴다.
 os.environ["DB_NAME"] = os.environ.get("TEST_DB_NAME", "reservation_test")
+# 테스트용 고정 서명 키. 실제 키(.env)와 무관하게 늘 같은 조건에서 돌게 한다.
+os.environ["JWT_SECRET_KEY"] = "test-secret-key-that-is-long-enough-for-hs256-0123456789"
 
 import pytest  # noqa: E402
 from alembic import command  # noqa: E402
@@ -15,8 +17,10 @@ from sqlalchemy import Connection  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from app.core.config import get_settings  # noqa: E402
+from app.core.security import create_access_token, hash_password  # noqa: E402
 from app.db.session import engine, get_db  # noqa: E402
 from app.main import app  # noqa: E402
+from app.models import User, UserRole  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,3 +68,27 @@ def client(db_session: Session) -> Iterator[TestClient]:
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+TEST_PASSWORD = "correct-horse-battery"
+
+
+def make_user(db: Session, email: str, role: UserRole = UserRole.USER) -> User:
+    user = User(email=email, password_hash=hash_password(TEST_PASSWORD), name="테스트", role=role)
+    db.add(user)
+    db.commit()
+    return user
+
+
+def auth_header(user: User) -> dict[str, str]:
+    return {"Authorization": f"Bearer {create_access_token(user.id)}"}
+
+
+@pytest.fixture
+def user(db_session: Session) -> User:
+    return make_user(db_session, "user@example.com")
+
+
+@pytest.fixture
+def admin(db_session: Session) -> User:
+    return make_user(db_session, "admin@example.com", role=UserRole.ADMIN)
