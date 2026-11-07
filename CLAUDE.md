@@ -40,10 +40,15 @@
 - 계층: `app/api/`(라우터, 입력과 응답 형식만) → `app/services/`(비즈니스 로직) → `app/models/`
   - 서비스는 `HTTPException` 대신 `app/core/exceptions.py`의 `NotFoundError`, `ConflictError` 등을 던진다. HTTP 상태 코드 변환은 예외 핸들러가 한다.
   - UNIQUE 같은 DB 제약 위반은 미리 SELECT로 확인하지 말고, 커밋할 때 `IntegrityError`를 잡아 변환한다(`app/db/errors.py`). 동시 요청에도 안전하기 때문이다.
+- 인증: `app/core/security.py`(Argon2id 해시, JWT), `app/api/deps.py`(`CurrentUser`, `AdminUser` 의존성).
+  - 로그인이 필요한 엔드포인트는 `user: CurrentUser`, 관리자 전용은 `_admin: AdminUser` 인자를 추가한다.
+  - 관리자 계정은 `python -m app.cli create-admin`으로만 만든다. 가입 API는 항상 USER다.
+  - `JWT_SECRET_KEY`는 기본값이 없다. `.env`에 없으면 앱이 시작되지 않는다(테스트는 conftest가 고정 키를 넣는다).
 - `app/schemas/`: Pydantic 요청과 응답. 요청 모델은 `extra="forbid"`. PATCH 모델은 "안 보냄"과 "null"을 구분한다.
 - `tests/`: pytest. 실제 MySQL 테스트 DB(`reservation_test`, `TEST_DB_NAME`으로 변경 가능)에서 돈다.
   - `conftest.py`가 세션 시작 시 `downgrade base` → `upgrade head`를 실행하고, 테스트마다 트랜잭션을 롤백한다(`join_transaction_mode="create_savepoint"`).
   - 이름이 `_test`로 끝나지 않는 DB에서는 테스트가 거부된다(개발 DB 보호).
+  - 로그인 상태가 필요하면 `user`, `admin` 픽스처와 `auth_header(user)`를 쓴다(`tests/conftest.py`).
   - CI는 MySQL 8.0 서비스 컨테이너를 띄운다(`.github/workflows/ci.yml`).
 - `scripts/init_db.sql`: 로컬 DB와 앱 전용 사용자 생성 (root로 1회 실행). 테이블은 여기서 만들지 않고 Alembic으로 만든다.
 - 시각은 모두 UTC, 시간대 정보 없는(naive) `datetime`으로 DB에 저장한다. 한국 시간 변환은 API 경계에서 한다.

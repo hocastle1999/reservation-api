@@ -3,7 +3,7 @@
 회의실 같은 공용 자원의 예약을 관리하는 REST API입니다.
 같은 시간대에 예약이 겹치지 않도록 하는 **동시성 제어**를 핵심 과제로 다룹니다.
 
-> 🚧 개발 중입니다. 현재는 자원(회의실) 관리 API까지 구현되어 있습니다.
+> 🚧 개발 중입니다. 현재는 회원가입·로그인과 자원(회의실) 관리 API까지 구현되어 있습니다.
 
 - 배포 주소: (배포 후 추가)
 - API 문서: 서버 실행 후 `/docs` (Swagger UI)
@@ -18,8 +18,8 @@
 
 ## 주요 기능 (계획)
 
-- [ ] 회원가입과 로그인 (JWT)
-- [x] 자원(회의실) 등록, 조회, 수정, 비활성화 (관리자 권한 검사는 인증 기능과 함께 추가 예정)
+- [x] 회원가입과 로그인 (JWT, Argon2id 비밀번호 해시)
+- [x] 자원(회의실) 등록, 조회, 수정, 비활성화 (등록과 수정은 관리자만)
 - [ ] 예약 생성, 조회, 취소
 - [ ] 같은 시간대 중복 예약 방지 (동시 요청 상황 포함)
 - [ ] 배포
@@ -30,12 +30,23 @@
 | --- | --- | --- |
 | GET | `/health` | 서버 상태 |
 | GET | `/health/db` | DB 연결 상태 (실패 시 503) |
-| POST | `/resources` | 자원 등록 (이름 중복 시 409) |
+| POST | `/auth/signup` | 회원가입 (이메일 중복 시 409) |
+| POST | `/auth/login` | 로그인, 액세스 토큰 발급 (OAuth2 form: `username`에 이메일) |
+| GET | `/users/me` | 내 정보 🔒 |
+| POST | `/resources` | 자원 등록 (이름 중복 시 409) 🔒 관리자 |
 | GET | `/resources` | 자원 목록 (`include_inactive`, `limit`, `offset`) |
 | GET | `/resources/{id}` | 자원 상세 |
-| PATCH | `/resources/{id}` | 자원 수정, `is_active: false`로 비활성화 |
+| PATCH | `/resources/{id}` | 자원 수정, `is_active: false`로 비활성화 🔒 관리자 |
 
-자세한 요청과 응답 형식은 서버 실행 후 `/docs`에서 볼 수 있습니다.
+🔒 표시는 `Authorization: Bearer <토큰>` 헤더가 필요합니다. 서버 실행 후 `/docs`에서 **Authorize** 버튼으로 로그인하면 바로 호출해 볼 수 있습니다.
+
+### 인증 설계
+
+- **비밀번호는 Argon2id로 해시**해 저장합니다. 비밀번호 전용으로 일부러 느리게 만든 알고리즘이라, DB가 유출돼도 무차별 대입이 어렵습니다.
+- **로그인 실패 응답을 하나로 통일**했습니다. "없는 이메일"과 "비밀번호 틀림"이 같은 메시지를 돌려줍니다. 없는 이메일일 때도 해시 검증을 한 번 실행해서 응답 시간도 비슷하게 맞췄습니다. 응답 내용이나 시간으로 가입 여부를 알아낼 수 없게 하기 위해서입니다.
+- **토큰을 검증할 때 매번 DB에서 사용자를 다시 읽습니다.** 토큰에 담긴 역할을 그대로 믿지 않기 때문에, 탈퇴했거나 권한이 바뀐 사용자의 옛 토큰은 통하지 않습니다.
+- **허용할 JWT 알고리즘을 서버에서 고정**했습니다. 토큰 헤더에 적힌 알고리즘을 그대로 믿지 않습니다.
+- **관리자는 API로 가입할 수 없습니다.** 관리 명령(`python -m app.cli create-admin`)으로만 만듭니다.
 
 ## DB 설계
 
@@ -66,13 +77,16 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 
 # 2. DB 준비: scripts/init_db.sql의 비밀번호를 바꾼 뒤 root 계정으로 실행
-# 3. 환경 변수: .env.example을 .env로 복사하고 DB_PASSWORD를 채운다
+# 3. 환경 변수: .env.example을 .env로 복사하고 DB_PASSWORD, JWT_SECRET_KEY를 채운다
 Copy-Item .env.example .env
 
 # 4. 테이블 생성 (Alembic 마이그레이션)
 .\.venv\Scripts\alembic.exe upgrade head
 
-# 5. 서버 실행
+# 5. 관리자 계정 만들기 (비밀번호는 프롬프트로 입력)
+.\.venv\Scripts\python.exe -m app.cli create-admin --email admin@example.com --name 관리자
+
+# 6. 서버 실행
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
@@ -103,7 +117,10 @@ app/
   schemas/         요청과 응답 형식 (Pydantic)
   services/        비즈니스 로직 (HTTP와 무관)
   api/             기능별 라우터
+  api/deps.py      로그인 사용자, 관리자 권한 의존성
+  core/security.py 비밀번호 해시, JWT 발급과 검증
   core/exceptions.py  서비스 예외를 HTTP 응답으로 변환
+  cli.py           관리 명령 (관리자 계정 생성)
 migrations/        Alembic 마이그레이션
 tests/             pytest 테스트
 scripts/           DB와 계정 생성 SQL
