@@ -1,0 +1,179 @@
+# DB 설계 (ERD)
+
+## 요구사항 정리
+
+설계 전에 "무엇을 저장해야 하는가"를 먼저 정리했다.
+
+1. 회원은 이메일과 비밀번호로 가입하고 로그인한다. 회원은 일반 사용자와 관리자로 나뉜다.
+2. 관리자는 예약 대상 자원(회의실 등)을 등록하고 수정한다. 더 이상 쓰지 않는 자원은 비활성화한다.
+3. 회원은 자원을 특정 시간대(시작~종료)로 예약하고, 자기 예약을 취소할 수 있다.
+4. **같은 자원의 확정된 예약끼리는 시간이 겹치면 안 된다.** 동시에 요청이 들어와도 지켜져야 한다.
+5. 취소된 예약도 기록으로 남긴다. (언제 누가 취소했는지 확인할 수 있어야 함)
+
+## ERD
+
+```mermaid
+erDiagram
+    users ||--o{ reservations : "예약한다"
+    resources ||--o{ reservations : "예약된다"
+
+    users {
+        BIGINT id PK
+        VARCHAR(255) email UK "로그인 ID"
+        VARCHAR(255) password_hash "평문 저장 금지"
+        VARCHAR(50) name
+        ENUM role "USER | ADMIN"
+        DATETIME created_at
+        DATETIME updated_at
+    }
+
+    resources {
+        BIGINT id PK
+        VARCHAR(100) name UK
+        VARCHAR(500) description "NULL 허용"
+        INT capacity "수용 인원, 1 이상"
+        VARCHAR(100) location "NULL 허용"
+        BOOLEAN is_active "비활성 자원은 예약 불가"
+        DATETIME created_at
+        DATETIME updated_at
+    }
+
+    reservations {
+        BIGINT id PK
+        BIGINT resource_id FK
+        BIGINT user_id FK
+        DATETIME start_at "UTC"
+        DATETIME end_at "UTC, start_at보다 커야 함"
+        ENUM status "CONFIRMED | CANCELLED"
+        VARCHAR(200) purpose "NULL 허용"
+        DATETIME cancelled_at "취소 시각, NULL 허용"
+        DATETIME created_at
+        DATETIME updated_at
+    }
+```
+
+- 회원 1명은 예약을 0개 이상 가진다. 자원 1개도 예약을 0개 이상 가진다.
+- `reservations`가 `users`와 `resources`를 잇는 테이블이다. 그런데 단순히 둘을 연결만 하는 테이블이 아니라 시간대와 상태라는 자기 속성을 가진 독립된 개체다. 그래서 `(user_id, resource_id)`를 묶은 복합키 대신 별도의 `id`를 기본키로 둔다. 같은 회원이 같은 자원을 여러 번 예약할 수 있기 때문이다.
+
+## 정규화 관점에서 확인한 것
+
+- **1정규형**: 모든 컬럼이 값 하나만 가진다. 예를 들어 "참석자 목록"을 한 칸에 쉼표로 넣지 않는다. 참석자 기능이 필요해지면 `reservation_attendees` 테이블로 분리한다.
+- **2정규형**: 모든 테이블의 기본키가 단일 컬럼(`id`)이다. 그래서 키의 일부에만 의존하는 컬럼(부분 함수 종속)이 생길 수 없다.
+- **3정규형**: `reservations`에 회원 이름이나 자원 이름을 복사해 두지 않는다. 이름은 `user_id`, `resource_id`를 통해서만 얻는다. 이름을 복사해 두면 회원이 이름을 바꿀 때 예약 행까지 모두 고쳐야 하는 갱신 이상이 생긴다.
+- **일부러 반정규화하지 않은 것**: "자원별 예약 수" 같은 집계 컬럼은 두지 않는다. 필요할 때 `COUNT`로 계산한다. 성능 문제가 실제로 측정되면 그때 다시 검토한다.
+
+## 설계 결정과 이유
+
+### 1. 시간은 `DATETIME`에 UTC로 저장
+
+- `TIMESTAMP`는 2038년까지만 표현할 수 있다. 또 DB 세션의 시간대 설정에 따라 값이 자동으로 변환된다.
+- `DATETIME`은 저장한 값을 그대로 돌려준다. 그래서 "항상 UTC로 저장하고, API에서 응답할 때 한국 시간으로 바꾼다"는 규칙을 앱에서 일관되게 지킨다.
+
+### 2. 예약은 지우지 않고 `status`로 취소 표시 (소프트 삭제)
+
+- 행을 `DELETE`하면 "누가 언제 예약했다가 취소했는지"가 사라진다.
+- 겹침 검사는 `status = 'CONFIRMED'`인 예약만 대상으로 한다. 그래서 취소된 시간대에는 다시 예약할 수 있다.
+
+### 3. `status`, `role`은 별도 테이블 대신 `ENUM`
+
+- 값이 2개로 고정되어 있고, 값마다 붙는 추가 정보도 없다. 그래서 코드 테이블을 따로 만들고 조인하는 비용이 더 크다고 판단했다.
+- 대신 값을 추가할 때는 `ALTER TABLE`이 필요하다. 상태가 자주 늘어나면 코드 테이블로 바꾸는 것을 검토한다.
+
+### 4. DB 제약으로 막을 수 있는 것은 DB에서 막는다
+
+- `CHECK (start_at < end_at)`: 끝나는 시각이 시작 시각보다 빠른 예약을 막는다. MySQL은 8.0.16부터 CHECK 제약을 실제로 검사한다.
+- `CHECK (capacity >= 1)`
+- `UNIQUE (email)`, `UNIQUE (name)`: 앱에서 먼저 확인하더라도, 동시에 요청이 들어올 수 있으므로 최종 보장은 DB가 한다.
+- 외래키는 `ON DELETE RESTRICT`로 둔다. 예약 기록이 있는 회원이나 자원은 지우지 못하게 하고, 자원은 `is_active = FALSE`로 비활성화한다.
+
+### 5. 인덱스: 자주 실행될 쿼리를 기준으로 정함
+
+| 인덱스 | 쓰이는 쿼리 |
+| --- | --- |
+| `(resource_id, start_at)` | 이 자원에서 이 시간대와 겹치는 예약이 있는가? 이 자원의 특정 날짜 예약 목록 |
+| `(user_id, start_at)` | 내 예약 목록 (시간순) |
+
+- `resource_id`가 앞에 오는 이유: 겹침 검사는 항상 "특정 자원"으로 먼저 좁힌 다음 시간 범위를 본다. 복합 인덱스는 왼쪽 컬럼부터 사용된다.
+- 외래키 컬럼에는 인덱스가 필요하다. 위 두 인덱스가 각각 `resource_id`, `user_id`로 시작하므로 따로 만들지 않아도 된다.
+- 실제 데이터를 넣은 뒤 `EXPLAIN`으로 인덱스가 쓰이는지 확인할 예정이다.
+
+## 핵심 과제: 겹치는 예약 막기
+
+두 예약 A, B가 겹치는 조건은 다음과 같다.
+
+```sql
+A.start_at < B.end_at AND B.start_at < A.end_at
+```
+
+끝나는 시각과 다음 예약의 시작 시각이 같은 경우(10:00~11:00 다음에 11:00~12:00)는 겹치지 않는 것으로 본다.
+
+문제는 **"겹치는 예약이 없는지 확인한 다음 INSERT"를 그냥 하면 동시 요청에서 깨진다는 것**이다. 두 요청이 동시에 확인하면 둘 다 "없음"을 보고, 둘 다 INSERT한다. 이 문제를 막는 방법으로 두 가지를 비교할 계획이다.
+
+| | 방법 A: 비관적 락 | 방법 B: 시간 칸 테이블 + UNIQUE |
+| --- | --- | --- |
+| 방식 | 트랜잭션 안에서 `SELECT ... FROM resources WHERE id = ? FOR UPDATE`로 자원 행을 잠근 뒤 겹침을 검사하고 INSERT한다 | 예약을 30분 칸으로 쪼개 `reservation_slots(resource_id, slot_start)`에 넣고 UNIQUE 제약으로 막는다 |
+| 장점 | 테이블 구조가 단순하다. 시간 단위의 제약이 없다 | DB 제약이 최종 보장을 한다. 락을 기다리지 않는다 |
+| 단점 | 같은 자원에 대한 예약 요청이 한 줄로 서서 처리된다 | 30분 단위로만 예약할 수 있다. 칸 데이터가 늘어난다 |
+
+- **방법 A를 먼저 구현한다.** 이번 설계의 테이블 3개로 바로 구현할 수 있다.
+- 그다음 동시에 예약 요청을 여러 개 보내는 테스트로 실제로 막히는지 확인한다. 이후 방법 B를 구현해 결과를 비교하고, 이 문서에 정리한다.
+- 겹치는 예약 행이 아니라 부모인 자원 행을 잠그는 이유가 있다. `reservations`에서 범위를 `FOR UPDATE`로 잠그면 InnoDB의 갭 락(gap lock)이 걸린다. 갭 락은 서로 막지 않기 때문에 두 트랜잭션이 같은 범위의 갭 락을 동시에 잡은 뒤 둘 다 INSERT하려고 하면 데드락이 생길 수 있다. 자원 행 하나를 잠그면 이 문제 없이 "자원별로 한 번에 하나씩"이 보장된다.
+
+## 목표 스키마 (DDL)
+
+아래 DDL은 설계를 확인하기 위한 것이다. 실제 테이블은 SQLAlchemy 모델과 마이그레이션(Alembic)으로 만든다. 그 결과가 아래와 같은지 비교할 예정이다.
+
+```sql
+CREATE TABLE users (
+    id            BIGINT       NOT NULL AUTO_INCREMENT,
+    email         VARCHAR(255) NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    name          VARCHAR(50)  NOT NULL,
+    role          ENUM('USER', 'ADMIN') NOT NULL DEFAULT 'USER',
+    created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_users_email (email)
+) ENGINE = InnoDB;
+
+CREATE TABLE resources (
+    id          BIGINT       NOT NULL AUTO_INCREMENT,
+    name        VARCHAR(100) NOT NULL,
+    description VARCHAR(500) NULL,
+    capacity    INT          NOT NULL,
+    location    VARCHAR(100) NULL,
+    is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_resources_name (name),
+    CONSTRAINT ck_resources_capacity CHECK (capacity >= 1)
+) ENGINE = InnoDB;
+
+CREATE TABLE reservations (
+    id           BIGINT       NOT NULL AUTO_INCREMENT,
+    resource_id  BIGINT       NOT NULL,
+    user_id      BIGINT       NOT NULL,
+    start_at     DATETIME     NOT NULL,
+    end_at       DATETIME     NOT NULL,
+    status       ENUM('CONFIRMED', 'CANCELLED') NOT NULL DEFAULT 'CONFIRMED',
+    purpose      VARCHAR(200) NULL,
+    cancelled_at DATETIME     NULL,
+    created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY ix_reservations_resource_start (resource_id, start_at),
+    KEY ix_reservations_user_start (user_id, start_at),
+    CONSTRAINT fk_reservations_resource FOREIGN KEY (resource_id)
+        REFERENCES resources (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_reservations_user FOREIGN KEY (user_id)
+        REFERENCES users (id) ON DELETE RESTRICT,
+    CONSTRAINT ck_reservations_time CHECK (start_at < end_at)
+) ENGINE = InnoDB;
+```
+
+## 앞으로 확장할 때 고려할 것 (지금은 만들지 않음)
+
+- 자원별 운영 시간 (예: 평일 09:00~18:00만 예약 가능): `resource_hours` 테이블
+- 참석자: `reservation_attendees (reservation_id, user_id)`
+- 예약 변경 이력: `reservation_histories`

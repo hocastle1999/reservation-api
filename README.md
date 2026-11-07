@@ -26,11 +26,22 @@
 
 ## DB 설계
 
-(ERD와 정규화 설명을 추가할 예정)
+`users`, `resources`, `reservations` 세 테이블로 구성합니다. ERD, 정규화 검토, 인덱스 설계 이유는 [docs/erd.md](docs/erd.md)에 정리했습니다.
+
+```mermaid
+erDiagram
+    users ||--o{ reservations : "예약한다"
+    resources ||--o{ reservations : "예약된다"
+```
 
 ## 기술적 고민
 
-(중복 예약 방지 방식 비교: 비관적 락 `SELECT ... FOR UPDATE` vs 시간 칸 단위 UNIQUE 제약)
+**같은 자원의 겹치는 예약을 동시 요청 상황에서도 막는 방법**을 두 가지로 구현하고 비교할 예정입니다.
+
+- 비관적 락: `SELECT ... FOR UPDATE`로 자원 행을 잠근 뒤 겹침 검사
+- 시간 칸 테이블 + UNIQUE 제약
+
+자세한 내용은 [docs/erd.md](docs/erd.md#핵심-과제-겹치는-예약-막기)에 있습니다.
 
 ## 로컬에서 실행하기
 
