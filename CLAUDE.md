@@ -22,15 +22,25 @@
 - 개발 서버: `.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload`
 - 테스트: `.\.venv\Scripts\python.exe -m pytest -q`
 - 린트/포맷: `.\.venv\Scripts\ruff.exe check .` / `.\.venv\Scripts\ruff.exe format .`
+- DB 마이그레이션 적용: `.\.venv\Scripts\alembic.exe upgrade head`
+- 모델 변경 후 마이그레이션 생성: `.\.venv\Scripts\alembic.exe revision --autogenerate -m "설명"`
+  - 생성된 파일은 반드시 읽고 고친 뒤, `upgrade head` → `downgrade -1` → `upgrade head` 왕복을 실제 MySQL에서 확인한다. (자동 생성된 downgrade가 MySQL에서 실패한 적이 있음: docs/troubleshooting.md)
+  - `alembic.exe check`로 모델과 DB가 일치하는지 확인한다.
 - 커밋 전에는 테스트, 린트, 포맷 검사를 모두 통과시킨다. CI도 같은 검사를 한다.
 
 ## 구조
 - `app/main.py`: FastAPI 앱 생성, 라우터 등록
 - `app/core/config.py`: 설정 (`get_settings()`)
-- `app/db/session.py`: 엔진, 세션, `get_db` 의존성
+- `app/db/session.py`: 엔진, 세션, `get_db` 의존성. 연결마다 세션 시간대를 UTC로 고정한다.
+- `app/db/base.py`: `Base`(제약 이름 규칙 포함), `TimestampMixin`
+- `app/models/`: ORM 모델. 새 모델은 `app/models/__init__.py`에도 import해야 Alembic이 인식한다.
+- `migrations/`: Alembic. 접속 정보는 `alembic.ini`가 아니라 `.env`에서 읽는다(`migrations/env.py`).
+  `alembic.ini`는 ASCII만 쓴다. Windows에서 cp949로 읽혀 한글이 들어가면 깨진다.
+- `docs/erd.md`: DB 설계 문서. 스키마를 바꾸면 함께 갱신한다.
 - `app/api/`: 라우터 (기능별 파일)
 - `tests/`: pytest. DB가 필요한 테스트는 `app.dependency_overrides[get_db]`로 세션을 바꿔 끼운다.
-- `scripts/init_db.sql`: 로컬 DB와 앱 전용 사용자 생성 (root로 1회 실행)
+- `scripts/init_db.sql`: 로컬 DB와 앱 전용 사용자 생성 (root로 1회 실행). 테이블은 여기서 만들지 않고 Alembic으로 만든다.
+- 시각은 모두 UTC, 시간대 정보 없는(naive) `datetime`으로 DB에 저장한다. 한국 시간 변환은 API 경계에서 한다.
 
 ## 규칙
 - 비밀번호 같은 비밀 정보는 `.env`에만 둔다. 코드, 문서, 커밋에 넣지 않는다. 새 설정을 추가하면 `.env.example`도 함께 갱신한다.

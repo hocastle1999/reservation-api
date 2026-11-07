@@ -56,7 +56,10 @@ py -3.11 -m venv .venv
 # 3. 환경 변수: .env.example을 .env로 복사하고 DB_PASSWORD를 채운다
 Copy-Item .env.example .env
 
-# 4. 서버 실행
+# 4. 테이블 생성 (Alembic 마이그레이션)
+.\.venv\Scripts\alembic.exe upgrade head
+
+# 5. 서버 실행
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
@@ -76,10 +79,13 @@ app/
   main.py          FastAPI 앱, 라우터 등록
   core/config.py   환경 변수 설정
   db/session.py    DB 엔진과 세션
+  db/base.py       ORM Base, 제약 이름 규칙
+  models/          ORM 모델 (users, resources, reservations)
   api/             기능별 라우터
+migrations/        Alembic 마이그레이션
 tests/             pytest 테스트
-scripts/           DB 초기화 SQL
-docs/              문제 해결 기록
+scripts/           DB와 계정 생성 SQL
+docs/              DB 설계, 문제 해결 기록
 ```
 
 ## 문제 해결 기록

@@ -121,7 +121,11 @@ A.start_at < B.end_at AND B.start_at < A.end_at
 
 ## 목표 스키마 (DDL)
 
-아래 DDL은 설계를 확인하기 위한 것이다. 실제 테이블은 SQLAlchemy 모델과 마이그레이션(Alembic)으로 만든다. 그 결과가 아래와 같은지 비교할 예정이다.
+아래 DDL은 설계를 확인하기 위한 것이다. 실제 테이블은 SQLAlchemy 모델(`app/models/`)과 Alembic 마이그레이션(`migrations/versions/`)으로 만든다.
+
+마이그레이션을 적용한 뒤 `SHOW CREATE TABLE`로 비교해 보니 컬럼, 기본값, 제약, 인덱스가 모두 아래와 같았다. 외래키 이름은 이름 규칙(`app/db/base.py`)에 따라 `fk_테이블_컬럼_참조테이블` 형식으로 정해진다.
+
+- 외래키를 만들 때 MySQL은 외래키 컬럼에 인덱스가 없으면 인덱스를 자동으로 만든다. 그런데 같은 컬럼으로 시작하는 복합 인덱스가 생기면, 자동으로 만든 인덱스는 지워진다. 그래서 결과 테이블에는 쓸데없는 중복 인덱스가 없다.
 
 ```sql
 CREATE TABLE users (
@@ -164,9 +168,9 @@ CREATE TABLE reservations (
     PRIMARY KEY (id),
     KEY ix_reservations_resource_start (resource_id, start_at),
     KEY ix_reservations_user_start (user_id, start_at),
-    CONSTRAINT fk_reservations_resource FOREIGN KEY (resource_id)
+    CONSTRAINT fk_reservations_resource_id_resources FOREIGN KEY (resource_id)
         REFERENCES resources (id) ON DELETE RESTRICT,
-    CONSTRAINT fk_reservations_user FOREIGN KEY (user_id)
+    CONSTRAINT fk_reservations_user_id_users FOREIGN KEY (user_id)
         REFERENCES users (id) ON DELETE RESTRICT,
     CONSTRAINT ck_reservations_time CHECK (start_at < end_at)
 ) ENGINE = InnoDB;
