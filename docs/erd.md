@@ -119,6 +119,36 @@ A.start_at < B.end_at AND B.start_at < A.end_at
 - 그다음 동시에 예약 요청을 여러 개 보내는 테스트로 실제로 막히는지 확인한다. 이후 방법 B를 구현해 결과를 비교하고, 이 문서에 정리한다.
 - 겹치는 예약 행이 아니라 부모인 자원 행을 잠그는 이유가 있다. `reservations`에서 범위를 `FOR UPDATE`로 잠그면 InnoDB의 갭 락(gap lock)이 걸린다. 갭 락은 서로 막지 않기 때문에 두 트랜잭션이 같은 범위의 갭 락을 동시에 잡은 뒤 둘 다 INSERT하려고 하면 데드락이 생길 수 있다. 자원 행 하나를 잠그면 이 문제 없이 "자원별로 한 번에 하나씩"이 보장된다.
 
+### 방법 A 구현 결과와 격리 수준 (READ COMMITTED)
+
+`app/services/reservation_service.py`의 `create_reservation`이 방법 A를 구현한다.
+
+```
+1. SELECT ... FROM resources WHERE id = ? FOR UPDATE   -- 같은 자원 요청은 여기서 대기
+2. SELECT id FROM reservations                          -- 겹침 검사 (잠금 없는 일반 읽기)
+   WHERE resource_id = ? AND status = 'CONFIRMED'
+     AND start_at < :end AND end_at > :start LIMIT 1
+3. INSERT INTO reservations ...
+4. COMMIT                                               -- 락 해제
+```
+
+**격리 수준은 MySQL 기본값(REPEATABLE READ)이 아니라 READ COMMITTED를 쓴다.** 동시 요청 테스트로 직접 확인한 문제 때문이다. (자세한 과정: [troubleshooting.md](troubleshooting.md))
+
+| | REPEATABLE READ (기본값) | READ COMMITTED (선택) |
+| --- | --- | --- |
+| 일반 SELECT가 보는 데이터 | 트랜잭션의 첫 일반 SELECT 시점의 스냅샷 | 각 문장을 실행하는 시점의 최신 커밋 |
+| 이 설계에서 결과 | 인증 단계에서 사용자를 먼저 읽어 스냅샷이 고정된다. 락을 받은 뒤에도 앞 요청의 예약이 안 보여 **중복 예약이 생겼다** | 락을 받은 뒤의 겹침 검사가 앞 요청의 예약을 본다 |
+| 잃는 것 | | 한 트랜잭션 안에서 같은 SELECT를 두 번 하면 결과가 다를 수 있다(반복 불가능한 읽기). 이 앱의 트랜잭션은 요청 하나 단위로 짧고, 같은 값을 다시 읽어 비교하는 로직이 없어서 문제가 되지 않는다 |
+
+- 덤으로, READ COMMITTED에서는 잠금 읽기나 UPDATE를 하더라도 검색 범위에 갭 락을 걸지 않는다(외래키와 중복 키 검사는 예외). 앞으로 취소 같은 UPDATE를 추가할 때 갭 락 데드락 걱정이 줄어든다.
+- 동시성 검증: `tests/test_reservation_concurrency.py`가 같은 시간대 요청 10개를 동시에 보내 1건만 성공하는지, 겹치지 않는 요청 10개는 모두 성공하는지 확인한다.
+
+### 예약 입력 규칙
+
+- 시각은 시간대를 포함해서 받는다(`+09:00`, `Z` 등). 시간대 없는 값은 한국 시간인지 UTC인지 알 수 없으므로 422로 거절한다. 응답은 한국 시간(`+09:00`)으로 돌려준다.
+- 분 단위만 받는다(초, 소수 초는 0). 컬럼이 `DATETIME`(소수 초 없음)이라 MySQL이 소수 초를 반올림해 저장하기 때문이다. 앱이 검사한 값과 저장된 값이 달라지는 것을 막는다.
+- 이미 지난 시각은 예약할 수 없다. 비활성 자원은 예약할 수 없다(409).
+
 ## 목표 스키마 (DDL)
 
 아래 DDL은 설계를 확인하기 위한 것이다. 실제 테이블은 SQLAlchemy 모델(`app/models/`)과 Alembic 마이그레이션(`migrations/versions/`)으로 만든다.

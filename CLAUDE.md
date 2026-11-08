@@ -32,6 +32,8 @@
 - `app/main.py`: FastAPI 앱 생성, 라우터 등록
 - `app/core/config.py`: 설정 (`get_settings()`)
 - `app/db/session.py`: 엔진, 세션, `get_db` 의존성. 연결마다 세션 시간대를 UTC로 고정한다.
+  - 격리 수준은 READ COMMITTED다. REPEATABLE READ로 되돌리면 예약 중복 방지가 깨진다(docs/troubleshooting.md).
+- `app/core/time.py`: UTC/KST 변환. 입력은 시간대 있는 시각만 받고(`AwareDatetime`), 응답은 `KstDatetime`으로 한국 시간을 내보낸다.
 - `app/db/base.py`: `Base`(제약 이름 규칙 포함), `TimestampMixin`
 - `app/models/`: ORM 모델. 새 모델은 `app/models/__init__.py`에도 import해야 Alembic이 인식한다.
 - `migrations/`: Alembic. 접속 정보는 `alembic.ini`가 아니라 `.env`에서 읽는다(`migrations/env.py`).
@@ -49,6 +51,7 @@
   - `conftest.py`가 세션 시작 시 `downgrade base` → `upgrade head`를 실행하고, 테스트마다 트랜잭션을 롤백한다(`join_transaction_mode="create_savepoint"`).
   - 이름이 `_test`로 끝나지 않는 DB에서는 테스트가 거부된다(개발 DB 보호).
   - 로그인 상태가 필요하면 `user`, `admin` 픽스처와 `auth_header(user)`를 쓴다(`tests/conftest.py`).
+  - 동시성 테스트는 롤백 픽스처를 쓰지 않고 스레드마다 `SessionLocal()`로 실제 커밋한 뒤 직접 지운다(`tests/test_reservation_concurrency.py`). 실제 요청처럼 락 전에 사용자 조회를 먼저 한다.
   - CI는 MySQL 8.0 서비스 컨테이너를 띄운다(`.github/workflows/ci.yml`).
 - `scripts/init_db.sql`: 로컬 DB와 앱 전용 사용자 생성 (root로 1회 실행). 테이블은 여기서 만들지 않고 Alembic으로 만든다.
 - 시각은 모두 UTC, 시간대 정보 없는(naive) `datetime`으로 DB에 저장한다. 한국 시간 변환은 API 경계에서 한다.
