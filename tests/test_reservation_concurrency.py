@@ -101,3 +101,34 @@ def test_concurrent_non_overlapping_requests_all_succeed(committed):
 
     assert results == Counter(created=THREADS)
     assert count_reservations(resource_id) == THREADS
+
+
+def test_only_one_of_concurrent_cancel_requests_succeeds(committed):
+    user_id, resource_id = committed
+    start = datetime(2030, 1, 7, 10, 0, tzinfo=KST)
+    with SessionLocal() as db:
+        reservation = reservation_service.create_reservation(
+            db,
+            db.get(User, user_id),
+            ReservationCreate(
+                resource_id=resource_id, start_at=start, end_at=start + timedelta(hours=1)
+            ),
+        )
+        reservation_id = reservation.id
+    barrier = threading.Barrier(THREADS)
+
+    def attempt(_: int) -> str:
+        with SessionLocal() as db:
+            user = db.get(User, user_id)
+            # 모든 스레드가 CONFIRMED 상태를 읽은 뒤 동시에 취소한다.
+            barrier.wait()
+            try:
+                reservation_service.cancel_reservation(db, user, reservation_id)
+                return "cancelled"
+            except ConflictError:
+                return "conflict"
+
+    with ThreadPoolExecutor(max_workers=THREADS) as pool:
+        results = Counter(pool.map(attempt, range(THREADS)))
+
+    assert results == Counter(cancelled=1, conflict=THREADS - 1)

@@ -1,3 +1,4 @@
+import datetime as dt
 from datetime import datetime
 from typing import Annotated, Self
 
@@ -62,3 +63,24 @@ class ReservationRead(BaseModel):
     purpose: str | None
     cancelled_at: KstDatetime | None
     created_at: KstDatetime
+
+
+class ReservationList(BaseModel):
+    items: list[ReservationRead]
+    total: int = Field(description="필터 조건에 맞는 전체 개수 (페이지와 무관)")
+
+
+class ReservationSlot(BaseModel):
+    """자원 일정표용. 누가 왜 예약했는지(user_id, purpose)는 내보내지 않고 시간대만 보여 준다."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    start_at: KstDatetime
+    end_at: KstDatetime
+
+
+class ResourceSchedule(BaseModel):
+    resource_id: int
+    # 필드 이름과 타입 이름이 같으면(date: date) 파이썬이 이름을 헷갈릴 수 있어 dt.date로 쓴다.
+    date: dt.date = Field(description="조회한 날짜 (한국 시간 기준)")
+    items: list[ReservationSlot]

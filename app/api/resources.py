@@ -1,10 +1,12 @@
+from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Query, status
 
 from app.api.deps import AdminUser, DbSession
+from app.schemas.reservation import ResourceSchedule
 from app.schemas.resource import ResourceCreate, ResourceList, ResourceRead, ResourceUpdate
-from app.services import resource_service
+from app.services import reservation_service, resource_service
 
 router = APIRouter(prefix="/resources", tags=["resources"])
 
@@ -52,6 +54,26 @@ def list_resources(
 )
 def get_resource(resource_id: int, db: DbSession):
     return resource_service.get_resource(db, resource_id)
+
+
+@router.get(
+    "/{resource_id}/reservations",
+    response_model=ResourceSchedule,
+    responses={404: ERROR_RESPONSES[404]},
+    summary="자원의 하루 예약 일정",
+    description=(
+        "한국 날짜 기준으로 그날과 겹치는 확정 예약의 시간대를 돌려준다. "
+        "빈 시간을 확인하는 용도라 예약한 사람과 목적은 보여 주지 않는다."
+    ),
+)
+def get_resource_schedule(
+    resource_id: int,
+    db: DbSession,
+    # 쿼리 이름은 date로 받되, 파이썬 변수 이름은 타입 이름(date)과 겹치지 않게 day로 쓴다.
+    day: Annotated[date, Query(alias="date", description="조회할 날짜 (예: 2030-01-07)")],
+):
+    items = reservation_service.list_resource_schedule(db, resource_id, day)
+    return ResourceSchedule(resource_id=resource_id, date=day, items=items)
 
 
 @router.patch(
