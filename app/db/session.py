@@ -10,9 +10,16 @@ from app.core.config import get_settings
 # 연결을 꺼내기 전에 살아 있는지 확인한다.
 # init_command: 연결마다 세션 시간대를 UTC로 고정한다. 로컬 MySQL은 보통 PC 시간대(KST)를
 # 따르기 때문에, 이걸 안 하면 CURRENT_TIMESTAMP 기본값이 한국 시간으로 저장된다.
+# isolation_level: MySQL 기본값(REPEATABLE READ) 대신 READ COMMITTED를 쓴다.
+# REPEATABLE READ는 트랜잭션의 첫 일반 SELECT 시점에 스냅샷을 고정한다. 예약 요청은
+# 인증 단계에서 사용자를 먼저 읽기 때문에, 자원 락을 기다렸다가 받은 뒤에도 겹침 검사가
+# "락을 기다리기 전" 스냅샷을 보고 앞 요청이 커밋한 예약을 못 본다. (중복 예약 발생)
+# READ COMMITTED는 문장마다 최신 커밋을 읽으므로 락을 받은 뒤의 겹침 검사가 정확하다.
+# (docs/troubleshooting.md, docs/erd.md 참고)
 engine = create_engine(
     get_settings().database_url,
     pool_pre_ping=True,
+    isolation_level="READ COMMITTED",
     connect_args={"init_command": "SET time_zone = '+00:00'"},
 )
 
