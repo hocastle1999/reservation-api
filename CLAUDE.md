@@ -42,6 +42,8 @@
 - 계층: `app/api/`(라우터, 입력과 응답 형식만) → `app/services/`(비즈니스 로직) → `app/models/`
   - 서비스는 `HTTPException` 대신 `app/core/exceptions.py`의 `NotFoundError`, `ConflictError` 등을 던진다. HTTP 상태 코드 변환은 예외 핸들러가 한다.
   - UNIQUE 같은 DB 제약 위반은 미리 SELECT로 확인하지 말고, 커밋할 때 `IntegrityError`를 잡아 변환한다(`app/db/errors.py`). 동시 요청에도 안전하기 때문이다.
+  - 상태 변경(예: 예약 취소)은 "읽고 객체 값을 바꿔 저장"하지 말고, 조건을 붙인 UPDATE 한 문장으로 하고 `rowcount`로 성공 여부를 판단한다(`reservation_service.cancel_reservation`).
+  - 남의 데이터에 접근하면 403이 아니라 404를 돌려준다(존재 여부를 숨긴다).
 - 인증: `app/core/security.py`(Argon2id 해시, JWT), `app/api/deps.py`(`CurrentUser`, `AdminUser` 의존성).
   - 로그인이 필요한 엔드포인트는 `user: CurrentUser`, 관리자 전용은 `_admin: AdminUser` 인자를 추가한다.
   - 관리자 계정은 `python -m app.cli create-admin`으로만 만든다. 가입 API는 항상 USER다.

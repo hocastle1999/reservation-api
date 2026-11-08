@@ -3,7 +3,7 @@
 회의실 같은 공용 자원의 예약을 관리하는 REST API입니다.
 같은 시간대에 예약이 겹치지 않도록 하는 **동시성 제어**를 핵심 과제로 다룹니다.
 
-> 🚧 개발 중입니다. 현재는 회원가입·로그인, 자원(회의실) 관리, 예약 생성 API까지 구현되어 있습니다.
+> 🚧 개발 중입니다. 현재는 회원가입·로그인, 자원(회의실) 관리, 예약 생성·조회·취소 API까지 구현되어 있습니다.
 
 - 배포 주소: (배포 후 추가)
 - API 문서: 서버 실행 후 `/docs` (Swagger UI)
@@ -20,8 +20,7 @@
 
 - [x] 회원가입과 로그인 (JWT, Argon2id 비밀번호 해시)
 - [x] 자원(회의실) 등록, 조회, 수정, 비활성화 (등록과 수정은 관리자만)
-- [x] 예약 생성
-- [ ] 예약 조회, 취소
+- [x] 예약 생성, 조회, 취소
 - [x] 같은 시간대 중복 예약 방지 (동시 요청 상황 포함, 비관적 락)
 - [ ] 다른 방식(시간 칸 + UNIQUE)으로 구현해 비교
 - [ ] 배포
@@ -39,7 +38,11 @@
 | GET | `/resources` | 자원 목록 (`include_inactive`, `limit`, `offset`) |
 | GET | `/resources/{id}` | 자원 상세 |
 | PATCH | `/resources/{id}` | 자원 수정, `is_active: false`로 비활성화 🔒 관리자 |
+| GET | `/resources/{id}/reservations?date=YYYY-MM-DD` | 자원의 하루 일정 (예약된 시간대만, 예약자는 비공개) |
 | POST | `/reservations` | 예약 생성 (시간이 겹치거나 비활성 자원이면 409) 🔒 |
+| GET | `/reservations/me` | 내 예약 목록 (`include_past`, `include_cancelled`, `limit`, `offset`) 🔒 |
+| GET | `/reservations/{id}` | 예약 상세 (남의 예약이면 404, 관리자는 모두 조회) 🔒 |
+| POST | `/reservations/{id}/cancel` | 예약 취소 (이미 취소했거나 시작된 예약이면 409) 🔒 |
 
 예약 시각은 시간대를 포함해 보냅니다(예: `2030-01-07T10:00:00+09:00`). 분 단위만 받고, 응답은 한국 시간으로 돌려줍니다.
 
@@ -71,6 +74,8 @@ erDiagram
 - 시간 칸 테이블 + UNIQUE 제약 (예정)
 
 **락을 걸었는데도 중복 예약이 생긴 문제**를 동시 요청 테스트로 찾았습니다. 같은 시간대 요청 10개를 동시에 보내자 10건이 모두 성공했습니다. 원인은 MySQL 기본 격리 수준(REPEATABLE READ)의 스냅샷이었습니다. 인증 단계에서 사용자를 먼저 읽을 때 스냅샷이 고정되어, 락을 받은 뒤에도 앞 요청이 커밋한 예약을 보지 못했습니다. 격리 수준을 READ COMMITTED로 바꿔 해결했고, 지금은 1건만 성공하고 9건은 409로 거절됩니다.
+
+**취소는 락 없이 조건부 UPDATE 한 문장으로 처리합니다.** `UPDATE ... SET status = 'CANCELLED' WHERE id = ? AND status = 'CONFIRMED'`를 실행하고 바뀐 행 수로 성공 여부를 판단합니다. "읽고 확인한 뒤 객체를 바꿔 저장"하는 방식으로 바꿔 보니, 같은 예약에 대한 동시 취소 요청 10개가 모두 성공했습니다. 조건부 UPDATE에서는 1건만 성공합니다.
 
 자세한 내용은 [docs/erd.md](docs/erd.md#핵심-과제-겹치는-예약-막기)와 [docs/troubleshooting.md](docs/troubleshooting.md)에 있습니다.
 
