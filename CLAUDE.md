@@ -35,11 +35,16 @@
 - `app/db/session.py`: 엔진, 세션, `get_db` 의존성. 연결마다 세션 시간대를 UTC로 고정한다.
   - 격리 수준은 READ COMMITTED다. REPEATABLE READ로 되돌리면 예약 중복 방지가 깨진다(docs/troubleshooting.md).
 - DB 연결 옵션(시간대, SSL)은 `Settings.database_connect_args` 한 곳에서 만들고, 앱 엔진과 `migrations/env.py`가 같이 쓴다.
-- 배포: Render 무료 웹 서비스(`render.yaml`) + Aiven MySQL. 절차는 README "배포".
+- 배포: 지금은 배포 직전까지만 준비했고, 실제 배포는 하지 않는다. 절차는 README "배포".
+  - 세 가지 방법을 준비했다: `Dockerfile`(관리형 MySQL과 함께 어느 플랫폼이든), `docker-compose.yml`(서버 한 대에 앱 + MySQL), `render.yaml`(Render + Aiven MySQL).
+  - 시작 명령은 `scripts/start.sh` 하나다(마이그레이션 → `exec uvicorn`). Dockerfile과 render.yaml이 같이 쓰므로 시작 방식은 이 파일만 고친다. `RUN_MIGRATIONS=false`면 마이그레이션을 건너뛴다.
+  - 로컬에는 Docker가 없다. 이미지는 CI의 `container` 작업이 빌드하고 compose로 띄워 확인한다. Dockerfile이나 compose를 바꾸면 CI 결과로 검증한다.
+  - 이미지에 넣을 파일을 추가하면 Dockerfile의 COPY와 `.dockerignore`를 함께 확인한다.
+  - 배포한다면 반드시 이 API 전용 Render 워크스페이스에서 한다. 기존 워크스페이스의 다른 무료 서비스가 750시간을 거의 다 써서, 같이 두면 두 서비스가 함께 정지된다.
   - 무료 플랜은 `preDeployCommand`가 없어서 시작 명령에서 `alembic upgrade head`를 먼저 실행한다.
   - 원격 DB는 `DB_SSL_CA`(Render 비밀 파일 `/etc/secrets/aiven-ca.pem`)로 인증서를 검증하며 접속한다.
   - Python은 `.python-version`(3.11)으로 고정한다. Render 기본값은 3.14다.
-  - 새 설정을 추가하면 `.env.example`과 함께 `render.yaml`의 `envVars`도 갱신한다.
+  - 새 설정을 추가하면 `.env.example`, `render.yaml`의 `envVars`, `docker-compose.yml`, README "환경 변수" 표를 함께 갱신한다.
 - `app/core/time.py`: UTC/KST 변환. 입력은 시간대 있는 시각만 받고(`AwareDatetime`), 응답은 `KstDatetime`으로 한국 시간을 내보낸다.
 - `app/db/base.py`: `Base`(제약 이름 규칙 포함), `TimestampMixin`
 - `app/models/`: ORM 모델. 새 모델은 `app/models/__init__.py`에도 import해야 Alembic이 인식한다.

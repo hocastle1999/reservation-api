@@ -3,9 +3,8 @@
 회의실 같은 공용 자원의 예약을 관리하는 REST API입니다.
 같은 시간대에 예약이 겹치지 않도록 하는 **동시성 제어**를 핵심 과제로 다룹니다.
 
-> 🚧 개발 중입니다. 현재는 회원가입·로그인, 자원(회의실) 관리, 예약 생성·조회·취소 API까지 구현되어 있습니다.
+회원가입·로그인, 자원(회의실) 관리, 예약 생성·조회·취소 API를 구현했습니다. 중복 예약을 막는 두 방식을 같은 테스트로 검증하고 부하를 측정해 비교했습니다. 배포는 설정과 절차까지 준비했고, 실제 서버는 띄우지 않았습니다([배포](#배포)).
 
-- 배포 주소: (배포 후 추가)
 - API 문서: 서버 실행 후 `/docs` (Swagger UI)
 
 ## 기술 스택
@@ -16,7 +15,7 @@
 | DB / ORM | MySQL 8.0, SQLAlchemy 2.x, PyMySQL |
 | 테스트 / 품질 | pytest, ruff, GitHub Actions |
 
-## 주요 기능 (계획)
+## 주요 기능
 
 - [x] 회원가입과 로그인 (JWT, Argon2id 비밀번호 해시)
 - [x] 자원(회의실) 등록, 조회, 수정, 비활성화 (등록과 수정은 관리자만)
@@ -24,7 +23,8 @@
 - [x] 같은 시간대 중복 예약 방지 (동시 요청 상황 포함, 비관적 락)
 - [x] 다른 방식(시간 칸 + 기본키)으로 구현해 같은 테스트로 검증
 - [x] 두 방식의 부하 측정 (처리량, 응답 시간, 데드락)
-- [ ] 배포 (설정 준비 완료, Render + Aiven MySQL)
+- [x] 배포 준비 (Docker 이미지, Docker Compose, Render Blueprint, 인증서를 검증하는 DB SSL 접속, CI의 이미지 실행 확인)
+- [ ] 실제 배포 (하지 않음, 이유는 [배포](#배포) 참고)
 
 ## API
 
@@ -134,12 +134,92 @@ Copy-Item .env.example .env
 
 ## 배포
 
-앱은 [Render](https://render.com) 무료 웹 서비스, DB는 [Aiven](https://aiven.io) 무료 MySQL 8.0에 둡니다. 설정은 저장소의 `render.yaml`(Render Blueprint)에 있습니다.
+**현재 상태: 배포 직전까지만 준비했습니다.** 아래 세 가지 방법 중 어느 것으로든 바로 배포할 수 있게 설정 파일과 절차를 갖췄고, 실제 서버는 띄우지 않았습니다.
 
-**왜 이렇게 나눴나**: Render의 관리형 DB는 PostgreSQL뿐입니다. 이 앱은 MySQL의 락 동작(`FOR UPDATE`, 중복 키 락)과 오류 번호(1062, 1213, 3819)에 기대기 때문에, 진짜 MySQL이 필요합니다.
+| 방법 | 파일 | 맞는 곳 |
+| --- | --- | --- |
+| [Docker 이미지](#방법-1-docker-이미지--관리형-mysql) | `Dockerfile` | Docker 이미지를 받는 플랫폼(Fly.io, Railway, Koyeb, Cloud Run, AWS ECS 등) + 관리형 MySQL |
+| [Docker Compose](#방법-2-docker-compose-서버-한-대) | `docker-compose.yml` | 서버 한 대(VPS, EC2 등)에 앱과 MySQL을 함께 |
+| [Render Blueprint](#방법-3-render--aiven-mysql) | `render.yaml` | Render 무료 웹 서비스 + Aiven 무료 MySQL |
 
-### 처음 배포하는 순서
+- 어느 방법이든 **MySQL 8.0**이 필요합니다. 이 앱은 MySQL의 락 동작(`FOR UPDATE`, 중복 키 락)과 오류 번호(1062, 1213, 3819)에 기대기 때문입니다. PostgreSQL이나 MySQL 호환 DB(TiDB 등)로 바꾸면 동시성 검증을 다시 해야 합니다.
+- 세 방법 모두 같은 시작 스크립트(`scripts/start.sh`)로 돕니다. 그래서 어디에 배포해도 시작 순서와 옵션이 같습니다.
+- 확인한 것: 시작 스크립트는 로컬에서 실행해 봤습니다(마이그레이션 → 서버 → `/health/db` 정상). Docker 이미지는 로컬에 Docker가 없어서, **CI가 커밋마다** 이미지를 빌드하고 MySQL과 함께 띄워 확인합니다(`.github/workflows/ci.yml`의 `container` 작업).
 
+### 환경 변수
+
+| 이름 | 필수 | 설명 |
+| --- | :---: | --- |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | ✅ | MySQL 접속 정보 |
+| `JWT_SECRET_KEY` | ✅ | 토큰 서명 키. 기본값이 없어서, 없으면 시작하지 않습니다. 만들기: `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `DB_SSL_CA` | 원격 DB면 ✅ | DB 서버의 CA 인증서 파일 경로. 지정하면 SSL로 접속하고 인증서를 검증합니다 |
+| `DB_SSL_VERIFY_IDENTITY` | | 인증서의 호스트 이름 검사 (기본 `true`) |
+| `RESERVATION_STRATEGY` | | 중복 예약 방지 방식 `lock`(기본) 또는 `slot` |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | | 토큰 유효 시간 (기본 60분) |
+| `PORT` | | 서버 포트 (기본 8000). 대부분의 플랫폼이 알아서 넣어 줍니다 |
+| `FORWARDED_ALLOW_IPS` | | `X-Forwarded-*` 헤더를 믿을 프록시 IP (기본 `127.0.0.1`). 플랫폼 프록시 뒤에서는 그 프록시의 IP, 모르면 `*` |
+| `RUN_MIGRATIONS` | | 시작할 때 마이그레이션 적용 여부 (기본 `true`) |
+
+### 공통: 시작 스크립트와 관리자 계정
+
+`scripts/start.sh`는 ① `alembic upgrade head`로 마이그레이션을 적용하고 ② uvicorn을 실행합니다.
+
+- **인스턴스가 하나면** 그대로 씁니다.
+- **인스턴스를 여러 개 띄우면** `RUN_MIGRATIONS=false`로 두고, 플랫폼의 배포 전 명령(release command, pre-deploy 등)에서 `python -m alembic upgrade head`를 한 번만 실행합니다. 여러 인스턴스가 동시에 시작하면서 마이그레이션이 겹쳐 돌면 안 되는데, Alembic은 이를 막아 주지 않기 때문입니다.
+- **헬스 체크**는 DB를 보지 않는 `/health`를 씁니다. DB 상태는 `/health/db`로 따로 봅니다.
+
+관리자 계정은 API로 만들 수 없고 관리 명령으로만 만듭니다. 비밀번호는 프롬프트로 입력합니다.
+
+```powershell
+# 서버나 컨테이너 셸에 들어갈 수 있으면 그 안에서
+python -m app.cli create-admin --email admin@example.com --name 관리자
+
+# 셸에 들어갈 수 없으면(Render 무료 플랜 등) 내 PC에서 운영 DB에 직접 접속해서.
+# 현재 창의 환경 변수가 .env보다 우선합니다.
+$env:DB_HOST="<Host>"; $env:DB_PORT="<Port>"; $env:DB_NAME="reservation"
+$env:DB_USER="<User>"; $env:DB_PASSWORD="<Password>"; $env:DB_SSL_CA="C:\path\to\ca.pem"
+.\.venv\Scripts\python.exe -m app.cli create-admin --email admin@example.com --name 관리자
+```
+
+### 방법 1: Docker 이미지 + 관리형 MySQL
+
+```bash
+docker build -t reservation-api .
+docker run -d -p 8000:8000 --env-file prod.env \
+  -v /path/to/ca.pem:/run/secrets/db-ca.pem:ro \
+  reservation-api
+```
+
+- `prod.env`에 위 환경 변수를 적고 `DB_SSL_CA=/run/secrets/db-ca.pem`으로 둡니다. 이 파일은 저장소에 올리지 않습니다.
+- 플랫폼에 배포할 때는 플랫폼이 이 `Dockerfile`로 이미지를 만들게 하거나, 직접 만든 이미지를 레지스트리에 올립니다. 환경 변수는 플랫폼의 비밀 값 설정에 넣고, CA 인증서는 플랫폼의 비밀 파일 기능이나 볼륨으로 넣습니다.
+- 관리형 MySQL은 Aiven, AWS RDS, Google Cloud SQL 등 MySQL 8.0이면 됩니다.
+
+### 방법 2: Docker Compose (서버 한 대)
+
+앱과 MySQL을 한 서버에 함께 띄웁니다. MySQL은 내부 네트워크로만 접속하고 포트를 밖에 열지 않으므로 SSL 설정이 필요 없습니다.
+
+```bash
+git clone <이 저장소> && cd reservation-api
+# 비밀 값은 서버의 .env에만 둡니다 (저장소에 올리지 않음)
+cat > .env <<'EOF'
+DB_PASSWORD=<MySQL 앱 계정 비밀번호>
+JWT_SECRET_KEY=<무작위 값>
+EOF
+docker compose up -d --build
+curl http://localhost:8000/health/db
+docker compose exec app python -m app.cli create-admin --email admin@example.com --name 관리자
+```
+
+- 데이터는 Docker 볼륨(`db-data`)에 남습니다. 관리형 DB와 달리 **백업은 직접 해야 합니다**(예: `docker compose exec db mysqldump ...`를 주기적으로 실행).
+- HTTPS는 앞에 리버스 프록시(Caddy, Nginx 등)를 두고 처리합니다. 이때 `FORWARDED_ALLOW_IPS`를 그 프록시의 IP로 바꿉니다.
+
+### 방법 3: Render + Aiven MySQL
+
+`render.yaml`(Render Blueprint)에 설정이 있습니다. Render의 관리형 DB는 PostgreSQL뿐이라 DB는 Aiven 무료 MySQL에 둡니다.
+
+**실제로 배포하지 않은 이유**: Render 무료 플랜은 **워크스페이스마다 한 달 750시간**을 주고, 그 워크스페이스의 무료 서비스가 모두 이 시간을 나눠 씁니다. 다 쓰면 그 워크스페이스의 무료 서비스가 **전부** 다음 달까지 정지됩니다. 같은 워크스페이스에서 이미 다른 서비스가 한 달 내내 깨어 있어 750시간을 거의 다 쓰므로, 여기에 이 API를 더하면 두 서비스가 함께 멈출 수 있습니다. 배포할 때는 아래 0단계처럼 이 API 전용 워크스페이스를 새로 만듭니다. Render는 무료 Hobby 워크스페이스를 계정당 5개까지 허용하고, 시간은 워크스페이스마다 따로 계산됩니다.
+
+0. **Render에서 이 API용 Hobby 워크스페이스를 새로 만듭니다.** 1~4단계는 모두 이 워크스페이스에서 합니다.
 1. **Aiven에서 MySQL 만들기**
    - 무료 플랜으로 MySQL 서비스를 만듭니다. Render 서비스(싱가포르)와 가까운 리전을 고르면 지연이 줄어듭니다.
    - 서비스 화면의 *Databases*에서 `reservation` 데이터베이스를 만듭니다.
@@ -150,24 +230,23 @@ Copy-Item .env.example .env
 3. **CA 인증서 올리기**
    - 서비스의 *Environment → Secret Files*에 파일 이름 `aiven-ca.pem`으로 CA 인증서 내용을 붙여 넣습니다(`/etc/secrets/aiven-ca.pem`).
    - 2단계에서 바로 시작된 첫 배포는 인증서가 없어서 실패할 수 있습니다. 인증서를 저장하면 다시 배포됩니다.
-4. **관리자 계정 만들기**: 무료 플랜은 서버 셸에 들어갈 수 없습니다. 그래서 내 PC에서 운영 DB에 직접 접속해 만듭니다. 이 명령은 `.env` 대신 현재 창의 환경 변수를 씁니다(환경 변수가 `.env`보다 우선).
+4. **관리자 계정과 확인**: 무료 플랜은 셸에 들어갈 수 없으므로 [위의 방법](#공통-시작-스크립트와-관리자-계정)대로 내 PC에서 만듭니다. `https://<서비스 이름>.onrender.com/health/db`가 `{"status":"ok","database":"ok"}`이면 DB까지 연결된 것입니다.
 
-   ```powershell
-   $env:DB_HOST="<Aiven Host>"; $env:DB_PORT="<Port>"; $env:DB_NAME="reservation"
-   $env:DB_USER="<User>"; $env:DB_PASSWORD="<Password>"; $env:DB_SSL_CA="C:\path\to\ca.pem"
-   .\.venv\Scripts\python.exe -m app.cli create-admin --email admin@example.com --name 관리자
-   ```
+Render 설정 메모:
 
-5. **확인**: `https://<서비스 이름>.onrender.com/health/db`가 `{"status":"ok","database":"ok"}`이면 DB까지 연결된 것입니다. API 문서는 `/docs`에 있습니다.
+- 무료 플랜은 배포 전 명령(`preDeployCommand`)을 쓸 수 없어서, 시작 스크립트에서 마이그레이션을 적용합니다. 인스턴스가 하나라 겹쳐 돌 일은 없습니다.
+- CI가 통과한 커밋만 배포합니다(`autoDeployTrigger: checksPass`).
+- Python 버전은 `.python-version`(3.11)으로 고정합니다. Render의 기본값은 3.14라서, 고정하지 않으면 로컬, CI와 다른 버전으로 돕니다.
+- 무료 플랜은 15분 동안 요청이 없으면 잠들고, 깨어나는 데 1분쯤 걸립니다. CPU가 0.1개라 로그인(Argon2 해시)이 로컬보다 느릴 수 있습니다.
 
 ### 배포 설정에서 고민한 것
 
-- **마이그레이션은 시작 명령에서 실행합니다**(`alembic upgrade head && uvicorn ...`). 원래는 배포 직전 단계(`preDeployCommand`)가 맞는 자리지만, Render 무료 플랜에서는 쓸 수 없습니다. 인스턴스가 하나라 마이그레이션이 동시에 두 번 돌 일은 없습니다. 인스턴스를 늘리면 `preDeployCommand`로 옮겨야 합니다.
 - **DB 연결은 SSL과 인증서 검증을 함께 씁니다.** `DB_SSL_CA`를 지정하면 PyMySQL이 서버 인증서와 호스트 이름을 검증합니다. 로컬에서 확인해 보니 PyMySQL은 CA를 지정하지 않아도 서버가 지원하면 암호화는 하지만, 인증서는 검증하지 않았습니다. 그러면 중간에 가짜 서버가 끼어들어도 알 수 없습니다. 반대로 엉뚱한 CA를 지정하자 `CERTIFICATE_VERIFY_FAILED`로 접속이 거부되어, 검증이 실제로 동작하는 것도 확인했습니다.
-- **헬스 체크는 DB를 보지 않는 `/health`를 씁니다.** `/health/db`를 쓰면 DB가 잠깐 끊겨도 Render가 앱을 계속 재시작합니다.
-- **CI가 통과한 커밋만 배포합니다**(`autoDeployTrigger: checksPass`).
-- **Python 버전은 `.python-version`(3.11)으로 고정합니다.** Render의 기본값은 3.14라서, 고정하지 않으면 로컬, CI와 다른 버전으로 돕니다.
-- **무료 플랜의 제약**: 15분 동안 요청이 없으면 잠들고, 다음 요청 때 깨어나는 데 1분쯤 걸립니다. CPU가 0.1개라서 로그인(Argon2 해시)이 로컬보다 느릴 수 있습니다.
+- **시작 명령을 스크립트 하나로 모았습니다.** Dockerfile과 render.yaml이 같은 `scripts/start.sh`를 실행하므로, 한쪽만 고쳐서 배포 환경마다 동작이 달라지는 일이 없습니다.
+- **스크립트는 마지막에 `exec`로 uvicorn을 실행합니다.** 셸이 남아 있으면 플랫폼이 종료할 때 보내는 SIGTERM을 셸이 받고 uvicorn에 전달하지 않습니다. 그러면 처리 중인 요청을 마치지 못하고 강제 종료됩니다.
+- **컨테이너는 root가 아닌 전용 사용자(uid 10001)로 돕니다.** 앱에 취약점이 있어도 컨테이너 안에서 할 수 있는 일을 줄이기 위해서입니다. CI가 이것도 확인합니다.
+- **이미지에 비밀 정보와 개발 도구를 넣지 않습니다.** `.dockerignore`가 `.env`, 인증서, 테스트, 문서를 빼고, 운영용 `requirements.txt`만 설치합니다. 이미지는 레지스트리에 올라가므로, 안에 든 파일은 누구나 꺼내 볼 수 있다고 생각해야 합니다.
+- **의존성을 소스보다 먼저 설치합니다.** Docker는 단계별 결과를 저장해 두므로, `requirements.txt`가 그대로면 소스만 바꿔 다시 빌드할 때 설치 단계를 건너뜁니다.
 
 ## 프로젝트 구조
 
@@ -187,8 +266,10 @@ app/
   cli.py           관리 명령 (관리자 계정 생성)
 migrations/        Alembic 마이그레이션
 tests/             pytest 테스트
-scripts/           DB와 계정 생성 SQL, 부하 측정 스크립트
+scripts/           DB와 계정 생성 SQL, 부하 측정, 운영 시작 스크립트(start.sh)
 docs/              DB 설계, 문제 해결 기록
+Dockerfile         운영 이미지
+docker-compose.yml 앱 + MySQL을 서버 한 대에 띄우는 설정
 render.yaml        Render 배포 설정 (Blueprint)
 ```
 
