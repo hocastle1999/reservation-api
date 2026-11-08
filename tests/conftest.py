@@ -84,6 +84,17 @@ def auth_header(user: User) -> dict[str, str]:
     return {"Authorization": f"Bearer {create_access_token(user.id)}"}
 
 
+@pytest.fixture(params=["lock", "slot"])
+def reservation_strategy(request, monkeypatch) -> str:
+    """예약 테스트를 두 방식(방법 A: 자원 행 락, 방법 B: 시간 칸)으로 한 번씩 돌린다.
+
+    같은 테스트가 두 방식에서 모두 통과해야 "두 방식이 같은 규칙을 지킨다"고 말할 수 있다.
+    테스트 파일에서 pytestmark = pytest.mark.usefixtures("reservation_strategy")로 쓴다.
+    """
+    monkeypatch.setattr(get_settings(), "reservation_strategy", request.param)
+    return request.param
+
+
 @pytest.fixture
 def user(db_session: Session) -> User:
     return make_user(db_session, "user@example.com")

@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,12 @@ class Settings(BaseSettings):
     jwt_secret_key: SecretStr
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
+
+    # 겹치는 예약을 막는 방식. 두 방식을 비교하려고 둘 다 구현했다. (docs/erd.md)
+    # lock: 자원 행을 SELECT ... FOR UPDATE로 잠근 뒤 겹침 검사
+    # slot: 30분 칸 테이블(reservation_slots)에 넣고 기본키 중복으로 막음
+    # 운영 중에 lock → slot으로 바꾸려면 기존 확정 예약의 칸을 먼저 채워 넣어야 한다.
+    reservation_strategy: Literal["lock", "slot"] = "lock"
 
     @property
     def database_url(self) -> URL:

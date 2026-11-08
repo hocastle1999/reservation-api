@@ -1,10 +1,13 @@
 from datetime import datetime
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from app.models import Reservation, ReservationStatus, Resource
+from app.models import Reservation, ReservationSlot, ReservationStatus, Resource
 from tests.conftest import auth_header, make_user
+
+# 이 파일의 모든 테스트를 방법 A(lock)와 방법 B(slot)로 한 번씩 실행한다.
+pytestmark = pytest.mark.usefixtures("reservation_strategy")
 
 # 테스트 시각은 모두 먼 미래로 둔다. (과거 시각은 예약할 수 없으므로)
 DAY = "2030-01-07"
@@ -68,6 +71,40 @@ def test_create_accepts_any_utc_offset(client, resource):
     assert response.json()["start_at"] == "2030-01-07T10:00:00+09:00"
 
 
+def test_slot_boundary_is_checked_in_utc(client, resource):
+    # +05:45(네팔)의 10:15는 UTC 04:30이라 30분 경계에 맞는다.
+    response = reserve(
+        client, resource.id, "2030-01-07T10:15:00+05:45", "2030-01-07T11:15:00+05:45"
+    )
+
+    assert response.status_code == 201
+    assert response.json()["start_at"] == "2030-01-07T13:30:00+09:00"
+
+
+def test_create_allows_max_duration(client, resource):
+    assert reserve(client, resource.id, kst("09:00"), kst("17:00")).status_code == 201
+
+
+def test_slots_are_stored_only_by_slot_strategy(client, resource, db_session, reservation_strategy):
+    reservation_id = reserve(client, resource.id, kst("10:00"), kst("11:30")).json()["id"]
+
+    slots = db_session.scalars(
+        select(ReservationSlot.slot_start)
+        .where(ReservationSlot.reservation_id == reservation_id)
+        .order_by(ReservationSlot.slot_start)
+    ).all()
+
+    if reservation_strategy == "slot":
+        # 한국 10:00 ~ 11:30 = UTC 01:00 ~ 02:30 → 칸 3개
+        assert slots == [
+            datetime(2030, 1, 7, 1, 0),
+            datetime(2030, 1, 7, 1, 30),
+            datetime(2030, 1, 7, 2, 0),
+        ]
+    else:
+        assert slots == []
+
+
 def test_create_requires_login(client, resource):
     client.headers.pop("Authorization")
 
@@ -84,6 +121,11 @@ def test_create_requires_login(client, resource):
         (kst("10:00"), kst("10:00"), {}),
         ("2030-01-07T10:00:30+09:00", kst("11:00"), {}),
         ("2030-01-07T10:00:00.5+09:00", kst("11:00"), {}),
+        (kst("10:15"), kst("11:00"), {}),
+        (kst("10:00"), kst("10:45"), {}),
+        # +05:45의 10:00은 UTC 04:15라 30분 경계가 아니다.
+        ("2030-01-07T10:00:00+05:45", "2030-01-07T11:00:00+05:45", {}),
+        (kst("09:00"), kst("17:30"), {}),
         (kst("10:00", "2020-01-01"), kst("11:00", "2020-01-01"), {}),
         (kst("10:00"), kst("11:00"), {"purpose": "가" * 201}),
         (kst("10:00"), kst("11:00"), {"unknown_field": "x"}),
@@ -94,6 +136,10 @@ def test_create_requires_login(client, resource):
         "zero-length",
         "seconds",
         "fractional-seconds",
+        "start-not-on-slot",
+        "end-not-on-slot",
+        "not-on-slot-in-utc",
+        "longer-than-8-hours",
         "past",
         "purpose-too-long",
         "extra",
@@ -131,9 +177,9 @@ def test_create_for_inactive_resource_returns_409(client, resource, db_session):
         ("10:30", "11:30"),
         ("09:00", "10:30"),
         ("11:30", "13:00"),
-        ("11:59", "12:30"),
+        ("11:30", "12:00"),
     ],
-    ids=["same", "covers", "inside", "overlaps-start", "overlaps-end", "one-minute"],
+    ids=["same", "covers", "inside", "overlaps-start", "overlaps-end", "last-slot"],
 )
 def test_overlapping_reservation_returns_409(client, resource, start, end):
     assert reserve(client, resource.id, kst("10:00"), kst("12:00")).status_code == 201
@@ -366,6 +412,13 @@ def test_cancel_own_reservation(client, resource, db_session):
     # 행은 지워지지 않고 남는다. (소프트 삭제)
     stored = db_session.get(Reservation, reservation_id)
     assert stored.status is ReservationStatus.CANCELLED
+    # 방법 B의 칸은 비워진다.
+    slot_count = db_session.scalar(
+        select(func.count())
+        .select_from(ReservationSlot)
+        .where(ReservationSlot.reservation_id == reservation_id)
+    )
+    assert slot_count == 0
 
 
 def test_cancel_twice_returns_409(client, resource):

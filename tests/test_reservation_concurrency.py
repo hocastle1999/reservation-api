@@ -5,6 +5,7 @@
 자기 세션을 열어 실제로 커밋하고, 테스트가 끝나면 만든 데이터를 직접 지운다.
 """
 
+import itertools
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,9 @@ from app.schemas.reservation import ReservationCreate
 from app.services import reservation_service
 
 THREADS = 10
+
+# 모든 테스트를 방법 A(lock)와 방법 B(slot)로 한 번씩 실행한다.
+pytestmark = pytest.mark.usefixtures("reservation_strategy")
 
 
 @pytest.fixture
@@ -101,6 +105,36 @@ def test_concurrent_non_overlapping_requests_all_succeed(committed):
 
     assert results == Counter(created=THREADS)
     assert count_reservations(resource_id) == THREADS
+
+
+def test_concurrent_chained_overlaps_never_double_book(committed):
+    # 요청 i는 10:00 + 30분*i 부터 1시간. 바로 옆 요청과 칸 하나씩 겹친다(사슬 모양).
+    # 어느 요청이 이길지는 실행 순서에 달려 있어 성공 개수는 정할 수 없다.
+    # 대신 "확정 예약끼리 겹치지 않는다"는 규칙과 "409 말고 다른 오류가 없다"를 확인한다.
+    user_id, resource_id = committed
+    base = datetime(2030, 1, 7, 10, 0, tzinfo=KST)
+    chained = [
+        ReservationCreate(
+            resource_id=resource_id,
+            start_at=base + timedelta(minutes=30 * i),
+            end_at=base + timedelta(minutes=30 * i + 60),
+        )
+        for i in range(THREADS)
+    ]
+
+    results = run_concurrently(user_id, chained)
+
+    assert set(results) <= {"created", "conflict"}
+    assert results["created"] >= 1
+    with SessionLocal() as db:
+        confirmed = db.execute(
+            select(Reservation.start_at, Reservation.end_at)
+            .where(Reservation.resource_id == resource_id)
+            .order_by(Reservation.start_at)
+        ).all()
+    assert len(confirmed) == results["created"]
+    for (_, prev_end), (next_start, _) in itertools.pairwise(confirmed):
+        assert prev_end <= next_start
 
 
 def test_only_one_of_concurrent_cancel_requests_succeeds(committed):

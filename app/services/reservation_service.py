@@ -1,11 +1,22 @@
-from datetime import date
+from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.exceptions import ConflictError, NotFoundError
 from app.core.time import kst_day_range, to_utc_naive, utc_now
-from app.models import Reservation, ReservationStatus, Resource, User, UserRole
+from app.db.errors import is_duplicate_entry
+from app.models import (
+    SLOT_MINUTES,
+    Reservation,
+    ReservationSlot,
+    ReservationStatus,
+    Resource,
+    User,
+    UserRole,
+)
 from app.schemas.reservation import ReservationCreate
 from app.services import resource_service
 
@@ -17,11 +28,21 @@ ALREADY_STARTED_MESSAGE = "이미 시작된 예약은 취소할 수 없습니다
 
 
 def create_reservation(db: Session, user: User, data: ReservationCreate) -> Reservation:
-    """겹치는 예약이 없을 때만 예약을 만든다. (비관적 락, docs/erd.md 참고)
+    """겹치는 예약이 없을 때만 예약을 만든다.
 
     "겹치는 예약이 있는지 조회 → 없으면 INSERT"를 그냥 하면, 동시에 들어온 두 요청이
-    둘 다 "없음"을 보고 둘 다 INSERT할 수 있다. 그래서 먼저 자원 행을 FOR UPDATE로
-    잠근다. 같은 자원에 대한 예약 요청은 이 줄에서 한 줄로 서고, 앞 요청이 커밋(또는
+    둘 다 "없음"을 보고 둘 다 INSERT할 수 있다. 이를 막는 방식을 두 가지 구현했고,
+    설정(RESERVATION_STRATEGY)으로 고른다. 비교는 docs/erd.md에 있다.
+    """
+    if get_settings().reservation_strategy == "slot":
+        return _create_with_slots(db, user, data)
+    return _create_with_lock(db, user, data)
+
+
+def _create_with_lock(db: Session, user: User, data: ReservationCreate) -> Reservation:
+    """방법 A: 자원 행을 FOR UPDATE로 잠근 뒤 겹침 검사.
+
+    같은 자원에 대한 예약 요청은 락을 잡는 줄에서 한 줄로 서고, 앞 요청이 커밋(또는
     롤백)해 락을 풀어야 다음 요청이 겹침 검사를 시작한다.
     """
     start_at = to_utc_naive(data.start_at)
@@ -36,12 +57,7 @@ def create_reservation(db: Session, user: User, data: ReservationCreate) -> Rese
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if resource is None:
-        db.rollback()
-        raise NotFoundError("자원을 찾을 수 없습니다.")
-    if not resource.is_active:
-        db.rollback()  # 락을 바로 풀어 준다.
-        raise ConflictError(INACTIVE_RESOURCE_MESSAGE)
+    _ensure_reservable(db, resource)
 
     # 두 구간이 겹치는 조건: A.start < B.end AND B.start < A.end
     # 끝 시각과 다음 예약의 시작 시각이 같으면(10~11시, 11~12시) 겹치지 않는다.
@@ -73,6 +89,65 @@ def create_reservation(db: Session, user: User, data: ReservationCreate) -> Rese
     # status, created_at 같은 DB 기본값을 읽어 온다.
     db.refresh(reservation)
     return reservation
+
+
+def _create_with_slots(db: Session, user: User, data: ReservationCreate) -> Reservation:
+    """방법 B: 예약이 차지하는 30분 칸을 reservation_slots에 함께 INSERT한다.
+
+    겹침 검사 SELECT도, 락도 없다. 기본키 (resource_id, slot_start)가 있어서 다른 확정
+    예약이 이미 차지한 칸이 하나라도 있으면 INSERT가 중복 키 오류(1062)로 실패한다.
+    그러면 예약 행까지 통째로 롤백하고 409로 바꾼다. (자원 이름 중복과 같은 방식)
+    """
+    start_at = to_utc_naive(data.start_at)
+    end_at = to_utc_naive(data.end_at)
+
+    resource = db.get(Resource, data.resource_id, populate_existing=True)
+    _ensure_reservable(db, resource)
+
+    reservation = Reservation(
+        resource_id=resource.id,
+        user_id=user.id,
+        start_at=start_at,
+        end_at=end_at,
+        purpose=data.purpose,
+    )
+    db.add(reservation)
+    try:
+        db.flush()  # 칸 행에 넣을 reservation.id를 얻는다.
+        # 칸은 항상 시간순으로 넣는다. 트랜잭션들이 같은 순서로 행 락을 잡게 해서
+        # "서로가 가진 칸을 기다리는" 순환 대기를 줄이기 위해서다.
+        db.add_all(
+            ReservationSlot(resource_id=resource.id, slot_start=slot, reservation_id=reservation.id)
+            for slot in _slot_starts(start_at, end_at)
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if is_duplicate_entry(exc):
+            raise ConflictError(OVERLAP_MESSAGE) from exc
+        raise
+    db.refresh(reservation)
+    return reservation
+
+
+def _slot_starts(start_at: datetime, end_at: datetime) -> list[datetime]:
+    """[start_at, end_at) 구간을 덮는 칸의 시작 시각들. 10:00~11:00 → [10:00, 10:30]"""
+    step = timedelta(minutes=SLOT_MINUTES)
+    slots = []
+    slot = start_at
+    while slot < end_at:
+        slots.append(slot)
+        slot += step
+    return slots
+
+
+def _ensure_reservable(db: Session, resource: Resource | None) -> None:
+    if resource is None:
+        db.rollback()
+        raise NotFoundError("자원을 찾을 수 없습니다.")
+    if not resource.is_active:
+        db.rollback()  # 락을 잡았다면 바로 풀어 준다.
+        raise ConflictError(INACTIVE_RESOURCE_MESSAGE)
 
 
 def get_reservation(db: Session, user: User, reservation_id: int) -> Reservation:
@@ -175,6 +250,9 @@ def cancel_reservation(db: Session, user: User, reservation_id: int) -> Reservat
         # 위에서 확인한 뒤 그 사이에 다른 요청이 먼저 취소했다.
         db.rollback()
         raise ConflictError(ALREADY_CANCELLED_MESSAGE)
+    # 방법 B의 칸을 비워 그 시간대를 다시 예약할 수 있게 한다. 상태 변경과 같은 트랜잭션이라
+    # 둘 중 하나만 반영되는 일은 없다. 방법 A로 만든 예약은 칸이 없으므로 0행이 지워진다.
+    db.execute(delete(ReservationSlot).where(ReservationSlot.reservation_id == reservation.id))
     db.commit()
     db.refresh(reservation)
     return reservation

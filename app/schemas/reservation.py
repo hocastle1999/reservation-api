@@ -14,7 +14,10 @@ from pydantic import (
 )
 
 from app.core.time import to_kst, to_utc_naive, utc_now
-from app.models import ReservationStatus
+from app.models import SLOT_MINUTES, ReservationStatus
+
+MAX_DURATION_HOURS = 8
+MAX_DURATION = dt.timedelta(hours=MAX_DURATION_HOURS)
 
 Purpose = Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
 
@@ -34,18 +37,25 @@ class ReservationCreate(BaseModel):
 
     @field_validator("start_at", "end_at")
     @classmethod
-    def require_whole_minutes(cls, value: datetime) -> datetime:
-        # 초와 마이크로초는 0이어야 한다. DB 컬럼은 DATETIME(소수 초 없음)이라
-        # MySQL이 소수 초를 "반올림"해 저장한다. 10:59:59.6이 11:00:00이 되면
-        # 앱이 검사한 값과 저장된 값이 달라지므로 처음부터 분 단위만 받는다.
-        if value.second or value.microsecond:
-            raise ValueError("시각은 분 단위로 입력해야 합니다. (초는 0)")
+    def require_slot_boundary(cls, value: datetime) -> datetime:
+        # 30분 단위(:00, :30)만 받는다. 방법 B(시간 칸)가 30분 칸으로만 막을 수 있어서,
+        # 두 방식을 같은 입력으로 비교하려고 방법 A에도 같은 규칙을 둔다.
+        # 초와 소수 초도 0이어야 한다. 컬럼이 DATETIME(소수 초 없음)이라 MySQL이 소수 초를
+        # 반올림해 저장하므로, 앱이 검사한 값과 저장된 값이 달라질 수 있다.
+        # UTC로 바꾼 뒤 검사한다. 칸은 UTC 기준으로 나뉘는데, +05:45 같은 시간대에서는
+        # 입력값의 :00이 UTC로는 :15가 되기 때문이다.
+        utc = to_utc_naive(value)
+        if utc.minute % SLOT_MINUTES or utc.second or utc.microsecond:
+            raise ValueError(f"시각은 {SLOT_MINUTES}분 단위로 입력해야 합니다. (예: 10:00, 10:30)")
         return value
 
     @model_validator(mode="after")
     def check_time_range(self) -> Self:
         if self.start_at >= self.end_at:
             raise ValueError("end_at은 start_at보다 늦어야 합니다.")
+        # 상한이 없으면 1년짜리 예약 하나가 자원을 독점하고, 방법 B에서는 칸이 17,520개 생긴다.
+        if self.end_at - self.start_at > MAX_DURATION:
+            raise ValueError(f"한 번에 최대 {MAX_DURATION_HOURS}시간까지 예약할 수 있습니다.")
         if to_utc_naive(self.start_at) <= utc_now():
             raise ValueError("이미 지난 시각은 예약할 수 없습니다.")
         return self
