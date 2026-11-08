@@ -21,6 +21,7 @@
 - 의존성 설치: `.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt`
 - 개발 서버: `.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload`
 - 테스트: `.\.venv\Scripts\python.exe -m pytest -q`
+- 부하 측정 (테스트 DB 사용): `.\.venv\Scripts\python.exe -m scripts.benchmark_reservations` (`--threads`, `--per-thread`, `--history`, `--scenarios`). 결과는 docs/erd.md "부하 측정"에 정리한다.
 - 린트/포맷: `.\.venv\Scripts\ruff.exe check .` / `.\.venv\Scripts\ruff.exe format .`
 - DB 마이그레이션 적용: `.\.venv\Scripts\alembic.exe upgrade head`
 - 모델 변경 후 마이그레이션 생성: `.\.venv\Scripts\alembic.exe revision --autogenerate -m "설명"`
@@ -44,6 +45,8 @@
   - UNIQUE 같은 DB 제약 위반은 미리 SELECT로 확인하지 말고, 커밋할 때 `IntegrityError`를 잡아 변환한다(`app/db/errors.py`). 동시 요청에도 안전하기 때문이다.
   - 상태 변경(예: 예약 취소)은 "읽고 객체 값을 바꿔 저장"하지 말고, 조건을 붙인 UPDATE 한 문장으로 하고 `rowcount`로 성공 여부를 판단한다(`reservation_service.cancel_reservation`).
   - 남의 데이터에 접근하면 403이 아니라 404를 돌려준다(존재 여부를 숨긴다).
+  - 예약 시간 범위를 찾는 쿼리는 `_overlap_conditions`를 쓴다. 최대 길이(`MAX_DURATION_HOURS`, DB CHECK `ck_reservations_duration`)를 전제로 하한을 걸어 검색 범위를 줄이므로, 상한을 바꾸면 CHECK 마이그레이션도 함께 만든다.
+  - 예약 생성은 데드락(1213)이 나면 최대 3번 다시 시도하고, 그래도 실패하면 503(`ServiceUnavailableError`)을 돌려준다.
   - 예약 생성은 `RESERVATION_STRATEGY`(lock|slot)에 따라 `_create_with_lock` 또는 `_create_with_slots`로 간다. 확정 예약의 상태를 바꾸는 코드는 방식과 상관없이 `reservation_slots`도 같은 트랜잭션에서 맞춰야 한다(예: 취소 시 칸 삭제).
 - 인증: `app/core/security.py`(Argon2id 해시, JWT), `app/api/deps.py`(`CurrentUser`, `AdminUser` 의존성).
   - 로그인이 필요한 엔드포인트는 `user: CurrentUser`, 관리자 전용은 `_admin: AdminUser` 인자를 추가한다.

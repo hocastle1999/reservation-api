@@ -45,7 +45,7 @@ erDiagram
         BIGINT resource_id FK
         BIGINT user_id FK
         DATETIME start_at "UTC"
-        DATETIME end_at "UTC, start_at보다 커야 함"
+        DATETIME end_at "UTC, start_at보다 크고 8시간 이내"
         ENUM status "CONFIRMED | CANCELLED"
         VARCHAR(200) purpose "NULL 허용"
         DATETIME cancelled_at "취소 시각, NULL 허용"
@@ -92,6 +92,7 @@ erDiagram
 ### 4. DB 제약으로 막을 수 있는 것은 DB에서 막는다
 
 - `CHECK (start_at < end_at)`: 끝나는 시각이 시작 시각보다 빠른 예약을 막는다. MySQL은 8.0.16부터 CHECK 제약을 실제로 검사한다.
+- `CHECK (TIMESTAMPDIFF(MINUTE, start_at, end_at) <= 480)`: 예약은 최대 8시간. 겹침 검사의 검색 범위 축소가 이 상한에 기댄다([아래](#겹침-검사의-검색-범위-줄이기)). PyMySQL은 CHECK 위반(3819)을 `IntegrityError`가 아니라 `OperationalError`로 올린다.
 - `CHECK (capacity >= 1)`
 - `UNIQUE (email)`, `UNIQUE (name)`: 앱에서 먼저 확인하더라도, 동시에 요청이 들어올 수 있으므로 최종 보장은 DB가 한다.
 - 외래키는 `ON DELETE RESTRICT`로 둔다. 예약 기록이 있는 회원이나 자원은 지우지 못하게 하고, 자원은 `is_active = FALSE`로 비활성화한다.
@@ -182,7 +183,62 @@ A.start_at < B.end_at AND B.start_at < A.end_at
 | 운영 중 전환 | | lock → slot으로 바꾸려면 기존 확정 예약의 칸을 먼저 채워 넣어야 한다 |
 
 - 검증: 같은 시간대 10건 동시 요청에서 1건만 성공, 겹치지 않는 10건은 모두 성공, 바로 옆과 칸 하나씩 겹치는 사슬 모양 10건에서 확정 예약끼리 겹치지 않음. 두 방식 모두 통과했고, 동시성 테스트를 15번 반복해도 같았다.
-- 아직 확인하지 않은 것: 동시 요청이 많을 때의 처리량과 응답 시간 차이, 그리고 방법 B에서 데드락(MySQL 1213)이 실제로 생기는지. 중복 키 오류가 난 트랜잭션이 롤백되면서 그 칸을 기다리던 여러 트랜잭션이 동시에 깨어나면 데드락이 날 수 있다고 알려져 있다. 15번 반복에서는 나오지 않았다. 지금 코드는 1213을 409로 바꾸지 않으므로, 생기면 500이 된다. 부하 테스트로 측정할 예정이다.
+- 데드락: 부하 측정에서 방법 B가 실제로 데드락(MySQL 1213)을 냈다. 그래서 예약 생성은 데드락이 나면 최대 3번까지 다시 시도하고, 그래도 안 되면 503을 돌려준다. 아래 [부하 측정](#부하-측정)을 참고한다.
+
+### 부하 측정
+
+`scripts/benchmark_reservations.py`로 두 방식을 같은 요청으로 측정했다. HTTP와 인증은 빼고 서비스 함수를 직접 부른다. 두 방식의 차이는 DB 처리에만 있기 때문이다. 실제 요청처럼 예약 전에 사용자를 한 번 읽는다.
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.benchmark_reservations --threads 32 --per-thread 30
+.\.venv\Scripts\python.exe -m scripts.benchmark_reservations --threads 32 --per-thread 30 --history 20000 --scenarios disjoint random-one-day
+```
+
+| 시나리오 | 내용 |
+| --- | --- |
+| `same-slot` | 모든 요청이 같은 자원의 같은 1시간 (1건만 성공) |
+| `disjoint` | 같은 자원, 서로 겹치지 않는 30분 (모두 성공) |
+| `random-one-day` | 같은 자원, 하루 안에서 무작위 시작, 30분~2시간 (일부 성공) |
+| `many-resources` | 자원 20개, 일주일 안에서 무작위 (경합 적음) |
+
+환경: Windows 11, MySQL 8.0.41(같은 PC), Python 3.11, CPU 12개. 32스레드 × 30건 = 960건씩, 처리량 단위는 건/초.
+
+| 시나리오 | lock 처리량 | slot 처리량 | lock p95 | slot p95 |
+| --- | ---: | ---: | ---: | ---: |
+| same-slot | 460 | 295 | 88ms | 213ms |
+| disjoint | 210 | 269 | 169ms | 167ms |
+| random-one-day | 442 | 299 | 86ms | 206ms |
+| many-resources | 281 | 278 | 164ms | 161ms |
+| disjoint, 과거 예약 2만 건 | 219 | 278 | 165ms | 153ms |
+
+64스레드에서도 경향이 같았다(disjoint: lock 214, slot 279 / same-slot: lock 431, slot 286). 모든 실행에서 "확정 예약끼리 겹치지 않음" 검증을 통과했다.
+
+**읽은 것**
+
+- **겹치지 않는 요청이 같은 자원에 몰리면 방법 B가 약 30% 빠르다.** 방법 A는 겹치지 않아도 자원 락에서 한 줄로 서기 때문이다. 스레드를 32개에서 64개로 늘려도 방법 A의 처리량은 그대로(210 → 214)였고, 응답 시간만 두 배가 됐다. 한 줄로 서는 구조라 동시성을 늘려도 소용이 없다는 뜻이다.
+- **거절이 많은 경합에서는 방법 A가 약 1.5배 빠르다.** 방법 A는 거절할 때 SELECT 두 번으로 끝난다. 방법 B는 예약 행과 칸을 INSERT하고, 아직 커밋되지 않은 같은 칸의 락을 기다렸다가 중복 오류를 받은 뒤 롤백한다. 그래서 거절 비용이 크고 p95가 두 배 이상이다.
+- **경합이 적으면 차이가 없다.** 이때는 두 방식 모두 DB 왕복 횟수가 비슷하다.
+- **방법 B만 데드락이 났다.** `random-one-day`에서 960건당 0~3번. 재시도를 넣기 전에는 3건이 처리되지 않은 오류로 끝났다(API였다면 500). 재시도를 넣은 뒤에는 데드락이 나도 모두 다시 시도해서 성공하거나 409가 됐고, 503은 0건이었다. 데드락 수는 서비스의 재시도 경고 로그로 센다.
+- **방법 A는 처음에 예약 기록이 쌓일수록 느려졌다.** 과거 예약 2만 건에서 처리량이 233에서 14로, p50이 2.3초로 떨어졌다. 겹침 검사 쿼리가 그 자원의 과거 예약을 전부 읽었기 때문이다. 하한 조건을 넣어 고쳤다(아래). 방법 B는 기본키로 바로 찾아서 기록 양과 상관이 없었다.
+
+**한계**: 숫자는 두 방식을 비교하는 용도로만 본다. PyMySQL은 순수 파이썬이라 GIL 때문에 처리량의 상한이 파이썬 쪽에 있다. DB도 같은 PC에서 돌아서 네트워크 지연이 없다. 실제 서버에서는 절대값이 다르게 나온다.
+
+**결론**: 기본값은 방법 A(`lock`)로 둔다. 회의실 예약은 인기 시간대(월요일 오전 등)에 같은 칸으로 요청이 몰리는 경우가 많다. 그러면 거절이 많은 경합이 되는데, 이 경우 방법 A가 빠르고 데드락도 없다. 대신 방법 A는 격리 수준에 기대는 구조라, 격리 수준을 READ COMMITTED로 고정하고 그 이유를 문서와 테스트로 남겼다. 겹치지 않는 대량 예약(좌석, 장비 대여처럼 칸이 많은 자원)이 주된 패턴이면 방법 B가 맞다.
+
+### 겹침 검사의 검색 범위 줄이기
+
+겹침 조건 `start_at < :end AND end_at > :start`는 인덱스 `(resource_id, start_at)`의 아래쪽 범위가 열려 있다. 그래서 그 자원의 과거 예약을 모두 읽는다. 과거 예약이 2만 건일 때 `EXPLAIN ANALYZE`를 보면 다음과 같았다.
+
+| | 읽은 행 | 시간 |
+| --- | ---: | ---: |
+| 하한 없음 | 20,000 | 18.5ms |
+| 하한 `start_at > :start - 8시간` 추가 | 0 | 0.01ms |
+
+예약은 최대 8시간이다. 그러므로 겹치는 예약은 반드시 "찾는 구간의 시작 − 8시간"보다 늦게 시작했다. 이 하한은 결과를 바꾸지 않고 읽는 범위만 8시간 안으로 줄인다. 하루 일정 조회 쿼리에도 같은 조건을 쓴다.
+
+- 이 최적화는 "8시간을 넘는 예약은 없다"는 전제에 기대므로, 앱 검증과 함께 DB CHECK 제약 `ck_reservations_duration`(`TIMESTAMPDIFF(MINUTE, start_at, end_at) <= 480`)으로도 막는다. SQL로 직접 넣은 행이 상한을 넘으면 겹치는 예약을 놓치기 때문이다.
+- 상한을 바꿀 때는 `app/models/reservation.py`의 `MAX_DURATION_HOURS`와 CHECK 제약 마이그레이션을 함께 바꾼다.
+- 방법 A에서 이 쿼리는 자원 락을 잡은 채로 실행된다. 그래서 쿼리가 느려지면 그 자원의 모든 예약 요청이 그만큼 줄을 서서 기다린다. 18.5ms짜리 쿼리 하나가 처리량을 초당 수십 건으로 묶은 이유다.
 
 ### 취소: 락 대신 조건부 UPDATE
 
@@ -265,7 +321,8 @@ CREATE TABLE reservations (
         REFERENCES resources (id) ON DELETE RESTRICT,
     CONSTRAINT fk_reservations_user_id_users FOREIGN KEY (user_id)
         REFERENCES users (id) ON DELETE RESTRICT,
-    CONSTRAINT ck_reservations_time CHECK (start_at < end_at)
+    CONSTRAINT ck_reservations_time CHECK (start_at < end_at),
+    CONSTRAINT ck_reservations_duration CHECK (TIMESTAMPDIFF(MINUTE, start_at, end_at) <= 480)
 ) ENGINE = InnoDB;
 
 -- 방법 B(시간 칸 + 기본키)용
