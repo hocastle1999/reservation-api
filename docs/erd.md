@@ -16,6 +16,8 @@
 erDiagram
     users ||--o{ reservations : "예약한다"
     resources ||--o{ reservations : "예약된다"
+    reservations ||--o{ reservation_slots : "차지한다 (방법 B)"
+    resources ||--o{ reservation_slots : "칸으로 나뉜다"
 
     users {
         BIGINT id PK
@@ -50,7 +52,15 @@ erDiagram
         DATETIME created_at
         DATETIME updated_at
     }
+
+    reservation_slots {
+        BIGINT resource_id PK,FK
+        DATETIME slot_start PK "UTC, 30분 단위"
+        BIGINT reservation_id FK "확정 예약만, 취소하면 삭제"
+    }
 ```
+
+- `reservation_slots`는 방법 B(시간 칸 + UNIQUE)에서만 쓴다. 아래 [방법 B 구현 결과](#방법-b-구현-결과-시간-칸--기본키)를 참고한다.
 
 - 회원 1명은 예약을 0개 이상 가진다. 자원 1개도 예약을 0개 이상 가진다.
 - `reservations`가 `users`와 `resources`를 잇는 테이블이다. 그런데 단순히 둘을 연결만 하는 테이블이 아니라 시간대와 상태라는 자기 속성을 가진 독립된 개체다. 그래서 `(user_id, resource_id)`를 묶은 복합키 대신 별도의 `id`를 기본키로 둔다. 같은 회원이 같은 자원을 여러 번 예약할 수 있기 때문이다.
@@ -107,7 +117,7 @@ A.start_at < B.end_at AND B.start_at < A.end_at
 
 끝나는 시각과 다음 예약의 시작 시각이 같은 경우(10:00~11:00 다음에 11:00~12:00)는 겹치지 않는 것으로 본다.
 
-문제는 **"겹치는 예약이 없는지 확인한 다음 INSERT"를 그냥 하면 동시 요청에서 깨진다는 것**이다. 두 요청이 동시에 확인하면 둘 다 "없음"을 보고, 둘 다 INSERT한다. 이 문제를 막는 방법으로 두 가지를 비교할 계획이다.
+문제는 **"겹치는 예약이 없는지 확인한 다음 INSERT"를 그냥 하면 동시 요청에서 깨진다는 것**이다. 두 요청이 동시에 확인하면 둘 다 "없음"을 보고, 둘 다 INSERT한다. 이 문제를 막는 방법 두 가지를 모두 구현했고, 설정 `RESERVATION_STRATEGY=lock|slot`으로 고른다(기본값 `lock`).
 
 | | 방법 A: 비관적 락 | 방법 B: 시간 칸 테이블 + UNIQUE |
 | --- | --- | --- |
@@ -115,13 +125,13 @@ A.start_at < B.end_at AND B.start_at < A.end_at
 | 장점 | 테이블 구조가 단순하다. 시간 단위의 제약이 없다 | DB 제약이 최종 보장을 한다. 락을 기다리지 않는다 |
 | 단점 | 같은 자원에 대한 예약 요청이 한 줄로 서서 처리된다 | 30분 단위로만 예약할 수 있다. 칸 데이터가 늘어난다 |
 
-- **방법 A를 먼저 구현한다.** 이번 설계의 테이블 3개로 바로 구현할 수 있다.
-- 그다음 동시에 예약 요청을 여러 개 보내는 테스트로 실제로 막히는지 확인한다. 이후 방법 B를 구현해 결과를 비교하고, 이 문서에 정리한다.
+- 방법 A를 먼저 구현하고 동시 요청 테스트로 검증한 뒤, 방법 B를 구현했다.
+- 두 방식을 공정하게 비교하려고 **같은 API, 같은 입력 규칙(30분 단위), 같은 테스트**를 쓴다. 예약 테스트는 `reservation_strategy` 픽스처로 두 방식에서 한 번씩 실행된다(`tests/conftest.py`).
 - 겹치는 예약 행이 아니라 부모인 자원 행을 잠그는 이유가 있다. `reservations`에서 범위를 `FOR UPDATE`로 잠그면 InnoDB의 갭 락(gap lock)이 걸린다. 갭 락은 서로 막지 않기 때문에 두 트랜잭션이 같은 범위의 갭 락을 동시에 잡은 뒤 둘 다 INSERT하려고 하면 데드락이 생길 수 있다. 자원 행 하나를 잠그면 이 문제 없이 "자원별로 한 번에 하나씩"이 보장된다.
 
 ### 방법 A 구현 결과와 격리 수준 (READ COMMITTED)
 
-`app/services/reservation_service.py`의 `create_reservation`이 방법 A를 구현한다.
+`app/services/reservation_service.py`의 `_create_with_lock`이 방법 A를 구현한다.
 
 ```
 1. SELECT ... FROM resources WHERE id = ? FOR UPDATE   -- 같은 자원 요청은 여기서 대기
@@ -142,6 +152,37 @@ A.start_at < B.end_at AND B.start_at < A.end_at
 
 - 덤으로, READ COMMITTED에서는 잠금 읽기나 UPDATE를 하더라도 검색 범위에 갭 락을 걸지 않는다(외래키와 중복 키 검사는 예외). 앞으로 취소 같은 UPDATE를 추가할 때 갭 락 데드락 걱정이 줄어든다.
 - 동시성 검증: `tests/test_reservation_concurrency.py`가 같은 시간대 요청 10개를 동시에 보내 1건만 성공하는지, 겹치지 않는 요청 10개는 모두 성공하는지 확인한다.
+
+### 방법 B 구현 결과 (시간 칸 + 기본키)
+
+`create_reservation`이 `RESERVATION_STRATEGY=slot`일 때 `_create_with_slots`로 동작한다.
+
+```
+1. SELECT ... FROM resources WHERE id = ?            -- 존재, 활성 여부만 확인 (락 없음)
+2. INSERT INTO reservations ...                       -- id를 얻기 위해 flush
+3. INSERT INTO reservation_slots VALUES               -- 예약이 차지하는 칸 전부, 시간순
+     (자원, 10:00, 예약), (자원, 10:30, 예약), ...
+4. COMMIT  -- 3에서 중복 키 오류(1062)가 나면 1~3을 통째로 롤백하고 409
+```
+
+- **겹침 검사 SELECT가 없다.** "같은 자원의 같은 칸은 한 행만"이라는 기본키 `(resource_id, slot_start)`가 최종 판단을 한다. 그래서 격리 수준이나 스냅샷과 상관없이 맞다. 방법 A에서 겪은 REPEATABLE READ 문제가 이 방식에는 처음부터 없다.
+- UNIQUE 제약을 따로 두지 않고 기본키로 만들었다. InnoDB는 기본키 순서로 행을 저장하므로, 같은 자원의 칸들이 시간순으로 붙어 저장된다.
+- 칸은 시간순으로 넣는다. 모든 트랜잭션이 같은 순서로 행 락을 잡게 해서, 서로가 가진 칸을 기다리는 순환 대기(데드락)를 줄인다.
+- 취소하면 같은 트랜잭션에서 그 예약의 칸을 지운다(`ix_reservation_slots_reservation_id` 사용). 예약 행은 기록으로 남고 칸만 비워져, 그 시간대를 다시 예약할 수 있다.
+- 자원 활성 여부는 락 없이 읽는다. 그래서 관리자가 자원을 비활성화하는 순간과 예약이 겹치면 예약이 하나 만들어질 수 있다. 방법 A는 자원 행을 잠그므로 이 경우도 막는다. 비활성화는 드문 관리 작업이라 허용했다.
+
+| | 방법 A: 자원 행 락 | 방법 B: 시간 칸 + 기본키 |
+| --- | --- | --- |
+| 최종 보장 | 앱 코드 (락 + 겹침 검사) | DB 제약 (기본키 중복) |
+| 격리 수준 영향 | 있음. REPEATABLE READ에서 중복 예약이 생겼다 | 없음 |
+| 같은 자원 동시 요청 | 겹치지 않아도 한 줄로 서서 처리 | 겹치는 칸이 없으면 서로 기다리지 않음 |
+| 시간 단위 | 제약 없음 (이 프로젝트는 비교를 위해 30분으로 맞춤) | 칸 크기(30분)로 고정 |
+| 저장 공간 | 예약 1행 | 예약 1행 + 칸 N행 (8시간 예약이면 16행) |
+| 실수할 여지 | 락을 빼먹거나 격리 수준을 바꾸면 조용히 깨진다 | 칸 생성과 삭제를 빼먹으면 깨진다 (상태 변경과 같은 트랜잭션에 묶음) |
+| 운영 중 전환 | | lock → slot으로 바꾸려면 기존 확정 예약의 칸을 먼저 채워 넣어야 한다 |
+
+- 검증: 같은 시간대 10건 동시 요청에서 1건만 성공, 겹치지 않는 10건은 모두 성공, 바로 옆과 칸 하나씩 겹치는 사슬 모양 10건에서 확정 예약끼리 겹치지 않음. 두 방식 모두 통과했고, 동시성 테스트를 15번 반복해도 같았다.
+- 아직 확인하지 않은 것: 동시 요청이 많을 때의 처리량과 응답 시간 차이, 그리고 방법 B에서 데드락(MySQL 1213)이 실제로 생기는지. 중복 키 오류가 난 트랜잭션이 롤백되면서 그 칸을 기다리던 여러 트랜잭션이 동시에 깨어나면 데드락이 날 수 있다고 알려져 있다. 15번 반복에서는 나오지 않았다. 지금 코드는 1213을 409로 바꾸지 않으므로, 생기면 500이 된다. 부하 테스트로 측정할 예정이다.
 
 ### 취소: 락 대신 조건부 UPDATE
 
@@ -165,7 +206,10 @@ WHERE id = ? AND status = 'CONFIRMED'
 ### 예약 입력 규칙
 
 - 시각은 시간대를 포함해서 받는다(`+09:00`, `Z` 등). 시간대 없는 값은 한국 시간인지 UTC인지 알 수 없으므로 422로 거절한다. 응답은 한국 시간(`+09:00`)으로 돌려준다.
-- 분 단위만 받는다(초, 소수 초는 0). 컬럼이 `DATETIME`(소수 초 없음)이라 MySQL이 소수 초를 반올림해 저장하기 때문이다. 앱이 검사한 값과 저장된 값이 달라지는 것을 막는다.
+- 30분 단위(`:00`, `:30`)만 받는다. 방법 B가 30분 칸으로만 막을 수 있어서, 두 방식을 같은 입력으로 비교하려고 방법 A에도 같은 규칙을 둔다.
+  - 경계는 UTC로 바꾼 뒤 검사한다. 칸이 UTC 기준으로 나뉘기 때문이다. 예를 들어 `+05:45`의 10:00은 UTC 04:15라 거절하고, 10:15는 UTC 04:30이라 받는다.
+  - 초와 소수 초도 0이어야 한다. 컬럼이 `DATETIME`(소수 초 없음)이라 MySQL이 소수 초를 반올림해 저장하기 때문이다. 앱이 검사한 값과 저장된 값이 달라지는 것을 막는다.
+- 한 번에 최대 8시간까지 예약할 수 있다. 상한이 없으면 예약 하나가 자원을 독점할 수 있고, 방법 B에서는 1년짜리 예약 하나에 칸이 17,520개 생긴다.
 - 이미 지난 시각은 예약할 수 없다. 비활성 자원은 예약할 수 없다(409).
 
 ## 목표 스키마 (DDL)
@@ -222,6 +266,19 @@ CREATE TABLE reservations (
     CONSTRAINT fk_reservations_user_id_users FOREIGN KEY (user_id)
         REFERENCES users (id) ON DELETE RESTRICT,
     CONSTRAINT ck_reservations_time CHECK (start_at < end_at)
+) ENGINE = InnoDB;
+
+-- 방법 B(시간 칸 + 기본키)용
+CREATE TABLE reservation_slots (
+    resource_id    BIGINT   NOT NULL,
+    slot_start     DATETIME NOT NULL,
+    reservation_id BIGINT   NOT NULL,
+    PRIMARY KEY (resource_id, slot_start),
+    KEY ix_reservation_slots_reservation_id (reservation_id),
+    CONSTRAINT fk_reservation_slots_reservation_id_reservations FOREIGN KEY (reservation_id)
+        REFERENCES reservations (id) ON DELETE CASCADE,
+    CONSTRAINT fk_reservation_slots_resource_id_resources FOREIGN KEY (resource_id)
+        REFERENCES resources (id) ON DELETE RESTRICT
 ) ENGINE = InnoDB;
 ```
 

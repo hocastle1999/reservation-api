@@ -44,6 +44,7 @@
   - UNIQUE 같은 DB 제약 위반은 미리 SELECT로 확인하지 말고, 커밋할 때 `IntegrityError`를 잡아 변환한다(`app/db/errors.py`). 동시 요청에도 안전하기 때문이다.
   - 상태 변경(예: 예약 취소)은 "읽고 객체 값을 바꿔 저장"하지 말고, 조건을 붙인 UPDATE 한 문장으로 하고 `rowcount`로 성공 여부를 판단한다(`reservation_service.cancel_reservation`).
   - 남의 데이터에 접근하면 403이 아니라 404를 돌려준다(존재 여부를 숨긴다).
+  - 예약 생성은 `RESERVATION_STRATEGY`(lock|slot)에 따라 `_create_with_lock` 또는 `_create_with_slots`로 간다. 확정 예약의 상태를 바꾸는 코드는 방식과 상관없이 `reservation_slots`도 같은 트랜잭션에서 맞춰야 한다(예: 취소 시 칸 삭제).
 - 인증: `app/core/security.py`(Argon2id 해시, JWT), `app/api/deps.py`(`CurrentUser`, `AdminUser` 의존성).
   - 로그인이 필요한 엔드포인트는 `user: CurrentUser`, 관리자 전용은 `_admin: AdminUser` 인자를 추가한다.
   - 관리자 계정은 `python -m app.cli create-admin`으로만 만든다. 가입 API는 항상 USER다.
@@ -53,6 +54,7 @@
   - `conftest.py`가 세션 시작 시 `downgrade base` → `upgrade head`를 실행하고, 테스트마다 트랜잭션을 롤백한다(`join_transaction_mode="create_savepoint"`).
   - 이름이 `_test`로 끝나지 않는 DB에서는 테스트가 거부된다(개발 DB 보호).
   - 로그인 상태가 필요하면 `user`, `admin` 픽스처와 `auth_header(user)`를 쓴다(`tests/conftest.py`).
+  - 예약 테스트는 `pytestmark = pytest.mark.usefixtures("reservation_strategy")`로 방법 A(lock)와 B(slot)에서 한 번씩 돈다. 예약 규칙을 바꾸면 두 방식 모두 통과해야 한다.
   - 동시성 테스트는 롤백 픽스처를 쓰지 않고 스레드마다 `SessionLocal()`로 실제 커밋한 뒤 직접 지운다(`tests/test_reservation_concurrency.py`). 실제 요청처럼 락 전에 사용자 조회를 먼저 한다.
   - CI는 MySQL 8.0 서비스 컨테이너를 띄운다(`.github/workflows/ci.yml`).
 - `scripts/init_db.sql`: 로컬 DB와 앱 전용 사용자 생성 (root로 1회 실행). 테이블은 여기서 만들지 않고 Alembic으로 만든다.
