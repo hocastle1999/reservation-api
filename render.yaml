@@ -12,14 +12,12 @@ services:
     # CI(GitHub Actions)가 통과한 커밋만 배포한다.
     autoDeployTrigger: checksPass
     buildCommand: pip install -r requirements.txt
+    # Docker 이미지와 같은 시작 스크립트를 쓴다: 마이그레이션 적용 → uvicorn 실행.
     # 무료 플랜은 preDeployCommand를 쓸 수 없어서, 시작할 때 마이그레이션을 먼저 적용한다.
     # 인스턴스가 하나라서 마이그레이션이 동시에 두 번 돌 일은 없다. 유료 플랜으로 바꾸거나
-    # 인스턴스를 늘리면 preDeployCommand로 옮긴다.
-    # --proxy-headers: Render의 프록시 뒤에 있으므로 X-Forwarded-* 헤더로 실제 프로토콜(https)과
-    # 클라이언트 IP를 알아낸다. 어느 프록시를 믿을지는 아래 FORWARDED_ALLOW_IPS로 정한다.
-    startCommand: >-
-      alembic upgrade head &&
-      uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
+    # 인스턴스를 늘리면 RUN_MIGRATIONS=false로 두고 preDeployCommand로 옮긴다.
+    # 실행 권한(chmod +x) 없이도 돌도록 sh로 실행한다. (Windows에서 커밋하면 권한이 안 붙는다)
+    startCommand: sh scripts/start.sh
     # DB를 확인하지 않는 /health를 쓴다. /health/db로 하면 DB가 잠깐 끊겨도 Render가
     # 앱을 계속 재시작한다. DB 상태는 /health/db로 따로 본다.
     healthCheckPath: /health

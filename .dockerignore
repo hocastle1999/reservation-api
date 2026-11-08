@@ -1,0 +1,25 @@
+# Docker 빌드에 넘기지 않을 파일. Dockerfile은 필요한 파일만 COPY하지만,
+# 여기서도 막아 두면 빌드가 빨라지고 비밀 정보가 실수로 이미지에 들어가지 않는다.
+
+# 비밀 정보: 이미지는 레지스트리에 올라가므로 .env가 들어가면 누구나 꺼내 볼 수 있다.
+.env
+.env.*
+!.env.example
+*.pem
+
+# 개발 환경과 캐시
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.git/
+.github/
+.vscode/
+.idea/
+.claude/
+
+# 운영에 필요 없는 파일
+tests/
+docs/
+*.md

@@ -53,3 +53,39 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+  # 운영 이미지(Dockerfile)가 실제로 빌드되고, MySQL과 함께 떠서 요청을 받는지 확인한다.
+  # 로컬에는 Docker가 없어서 이미지 검증은 여기서만 한다.
+  container:
+    runs-on: ubuntu-latest
+
+    # CI 전용 값. 실제 배포의 비밀 값과는 무관하다.
+    env:
+      DB_PASSWORD: ci-compose-password
+      JWT_SECRET_KEY: ci-only-secret-key-that-is-long-enough-for-hs256-0123456789
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # --wait: 앱 컨테이너의 HEALTHCHECK가 통과할 때까지 기다린다. 시작 스크립트가
+      # 마이그레이션에서 실패하거나 서버가 죽으면 여기서 실패한다.
+      - name: Build image and start app with MySQL
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Smoke test
+        run: |
+          curl -fsS http://localhost:8000/health
+          curl -fsS http://localhost:8000/health/db
+          # 마이그레이션이 적용되어 테이블이 있어야 200이 나온다.
+          curl -fsS http://localhost:8000/resources
+          docker compose exec -T app python -m alembic current
+          # root가 아닌 전용 사용자(uid 10001)로 돌아야 한다.
+          test "$(docker compose exec -T app id -u)" = "10001"
+
+      - name: Show logs
+        if: always()
+        run: docker compose logs
+
+      - name: Stop
+        if: always()
+        run: docker compose down -v

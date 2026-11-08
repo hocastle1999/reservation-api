@@ -1,0 +1,55 @@
+# 앱과 MySQL 8.0을 함께 띄운다. 서버(VPS) 한 대에 직접 배포하거나, 운영과 같은
+# 컨테이너 환경을 로컬에서 확인할 때 쓴다. CI도 이 파일로 이미지가 실제로 뜨는지 확인한다.
+#
+#   DB_PASSWORD=... JWT_SECRET_KEY=... docker compose up -d --build
+#   curl http://localhost:8000/health/db
+#
+# 비밀 값은 이 파일에 적지 않는다. 셸 환경 변수나 같은 폴더의 .env에서 읽고, 없으면 시작을 거부한다.
+# 관리형 DB(Aiven, RDS 등)를 쓰는 플랫폼에서는 이 파일 대신 Dockerfile만 쓴다.
+
+services:
+  db:
+    # CI(.github/workflows/ci.yml)와 같은 MySQL 버전
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: reservation
+      MYSQL_USER: reservation_app
+      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD를 설정하세요}
+      # 앱은 root를 쓰지 않는다. root 비밀번호는 무작위로 만들고 로그에만 한 번 찍힌다.
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
+    volumes:
+      # 컨테이너를 지웠다 다시 만들어도 데이터가 남도록 볼륨에 저장한다.
+      - db-data:/var/lib/mysql
+    # 포트를 밖으로 열지 않는다. 앱만 내부 네트워크로 접속한다.
+    healthcheck:
+      # MySQL 이미지는 처음 초기화(사용자, DB 생성)할 때 TCP를 열지 않는 임시 서버를 쓴다.
+      # 그래서 127.0.0.1(TCP)로 ping하면 초기화가 끝나고 실제 서버가 뜬 뒤에야 성공한다.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  app:
+    build: .
+    depends_on:
+      # MySQL이 접속을 받을 수 있게 된 뒤에 앱을 시작한다. (시작 스크립트가 바로 마이그레이션을 돌린다)
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_NAME: reservation
+      DB_USER: reservation_app
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD를 설정하세요}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY를 설정하세요}
+      RESERVATION_STRATEGY: ${RESERVATION_STRATEGY:-lock}
+      # 앞에 Nginx 같은 리버스 프록시를 두면 그 프록시의 IP로 바꾼다.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    restart: unless-stopped
+
+volumes:
+  db-data:
