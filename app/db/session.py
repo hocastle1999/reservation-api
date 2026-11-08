@@ -10,8 +10,9 @@ from app.core.config import get_settings
 # create_engine은 이 시점에 DB에 접속하지 않는다. 첫 쿼리 때 연결 풀에서 연결을 만든다.
 # pool_pre_ping: MySQL이 오래 쉬던 연결을 끊어 버린 경우(wait_timeout)를 대비해
 # 연결을 꺼내기 전에 살아 있는지 확인한다.
-# init_command: 연결마다 세션 시간대를 UTC로 고정한다. 로컬 MySQL은 보통 PC 시간대(KST)를
-# 따르기 때문에, 이걸 안 하면 CURRENT_TIMESTAMP 기본값이 한국 시간으로 저장된다.
+# connect_args: 연결마다 세션 시간대를 UTC로 고정하고, 설정에 따라 SSL로 접속한다.
+# 로컬 MySQL은 보통 PC 시간대(KST)를 따르기 때문에, 시간대를 고정하지 않으면
+# CURRENT_TIMESTAMP 기본값이 한국 시간으로 저장된다. (Settings.database_connect_args)
 # isolation_level: MySQL 기본값(REPEATABLE READ) 대신 READ COMMITTED를 쓴다.
 # REPEATABLE READ는 트랜잭션의 첫 일반 SELECT 시점에 스냅샷을 고정한다. 예약 요청은
 # 인증 단계에서 사용자를 먼저 읽기 때문에, 자원 락을 기다렸다가 받은 뒤에도 겹침 검사가
@@ -29,7 +30,7 @@ def create_app_engine(**pool_options: Any) -> Engine:
         get_settings().database_url,
         pool_pre_ping=True,
         isolation_level="READ COMMITTED",
-        connect_args={"init_command": "SET time_zone = '+00:00'"},
+        connect_args=get_settings().database_connect_args,
         **pool_options,
     )
 

@@ -36,8 +36,8 @@ def run_migrations_online() -> None:
     connectable = create_engine(
         database_url,
         poolclass=pool.NullPool,
-        # 앱과 같은 세션 시간대(UTC)를 쓴다. (app/db/session.py 참고)
-        connect_args={"init_command": "SET time_zone = '+00:00'"},
+        # 앱과 같은 연결 옵션(세션 시간대 UTC, SSL)을 쓴다. (app/core/config.py 참고)
+        connect_args=get_settings().database_connect_args,
     )
 
     with connectable.connect() as connection:
