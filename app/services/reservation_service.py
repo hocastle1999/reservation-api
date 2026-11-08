@@ -1,14 +1,16 @@
+import logging
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import ColumnElement, delete, func, select, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.exceptions import ConflictError, NotFoundError
+from app.core.exceptions import ConflictError, NotFoundError, ServiceUnavailableError
 from app.core.time import kst_day_range, to_utc_naive, utc_now
-from app.db.errors import is_duplicate_entry
+from app.db.errors import is_deadlock, is_duplicate_entry
 from app.models import (
+    MAX_DURATION,
     SLOT_MINUTES,
     Reservation,
     ReservationSlot,
@@ -20,11 +22,17 @@ from app.models import (
 from app.schemas.reservation import ReservationCreate
 from app.services import resource_service
 
+logger = logging.getLogger(__name__)
+
 OVERLAP_MESSAGE = "이미 예약된 시간대와 겹칩니다."
 INACTIVE_RESOURCE_MESSAGE = "비활성화된 자원은 예약할 수 없습니다."
 NOT_FOUND_MESSAGE = "예약을 찾을 수 없습니다."
 ALREADY_CANCELLED_MESSAGE = "이미 취소된 예약입니다."
 ALREADY_STARTED_MESSAGE = "이미 시작된 예약은 취소할 수 없습니다."
+BUSY_MESSAGE = "요청이 몰려 예약을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요."
+
+# 데드락이 났을 때 처음 시도를 포함해 몇 번까지 해 볼지.
+DEADLOCK_RETRIES = 3
 
 
 def create_reservation(db: Session, user: User, data: ReservationCreate) -> Reservation:
@@ -34,9 +42,31 @@ def create_reservation(db: Session, user: User, data: ReservationCreate) -> Rese
     둘 다 "없음"을 보고 둘 다 INSERT할 수 있다. 이를 막는 방식을 두 가지 구현했고,
     설정(RESERVATION_STRATEGY)으로 고른다. 비교는 docs/erd.md에 있다.
     """
-    if get_settings().reservation_strategy == "slot":
-        return _create_with_slots(db, user, data)
-    return _create_with_lock(db, user, data)
+    create = (
+        _create_with_slots if get_settings().reservation_strategy == "slot" else _create_with_lock
+    )
+    # 데드락(MySQL 1213)이 나면 트랜잭션을 처음부터 다시 시도한다.
+    # 부하 측정에서 방법 B가 실제로 데드락을 냈다(docs/troubleshooting.md). InnoDB는 데드락이
+    # 나면 한쪽 트랜잭션을 통째로 롤백할 뿐이고, 그 요청이 틀린 것은 아니다. 그래서 409로
+    # 거절하지 않고 다시 시도한다. MySQL 문서도 "데드락으로 실패한 트랜잭션은 다시 실행할
+    # 준비를 하라"고 권한다. 롤백된 트랜잭션은 아무것도 남기지 않으므로 다시 해도 안전하다.
+    for attempt in range(1, DEADLOCK_RETRIES + 1):
+        try:
+            return create(db, user, data)
+        except OperationalError as exc:
+            db.rollback()
+            if not is_deadlock(exc):
+                raise
+            # 재시도로 사용자에게 안 보이는 데드락도 로그로 남겨 발생 빈도를 알 수 있게 한다.
+            logger.warning(
+                "예약 생성 중 데드락 (%d/%d회째, resource_id=%s)",
+                attempt,
+                DEADLOCK_RETRIES,
+                data.resource_id,
+            )
+            if attempt == DEADLOCK_RETRIES:
+                raise ServiceUnavailableError(BUSY_MESSAGE) from exc
+    raise AssertionError("unreachable")
 
 
 def _create_with_lock(db: Session, user: User, data: ReservationCreate) -> Reservation:
@@ -61,14 +91,12 @@ def _create_with_lock(db: Session, user: User, data: ReservationCreate) -> Reser
 
     # 두 구간이 겹치는 조건: A.start < B.end AND B.start < A.end
     # 끝 시각과 다음 예약의 시작 시각이 같으면(10~11시, 11~12시) 겹치지 않는다.
-    # 인덱스 (resource_id, start_at)로 자원을 먼저 좁힌 뒤 시간 범위를 본다.
     overlapping_id = db.scalar(
         select(Reservation.id)
         .where(
             Reservation.resource_id == resource.id,
             Reservation.status == ReservationStatus.CONFIRMED,
-            Reservation.start_at < end_at,
-            Reservation.end_at > start_at,
+            *_overlap_conditions(start_at, end_at),
         )
         .limit(1)
     )
@@ -141,6 +169,24 @@ def _slot_starts(start_at: datetime, end_at: datetime) -> list[datetime]:
     return slots
 
 
+def _overlap_conditions(start_at: datetime, end_at: datetime) -> list[ColumnElement[bool]]:
+    """[start_at, end_at)와 겹치는 예약을 찾는 조건. 인덱스 (resource_id, start_at)를 쓴다.
+
+    겹침 조건만으로는 start_at의 아래쪽 범위가 열려 있다(start_at < end_at). 그러면 인덱스가
+    그 자원의 과거 예약을 전부 훑는다. 과거 예약 2만 건이 있을 때 검사 한 번이 2만 행을 읽었고,
+    방법 A의 처리량이 233건/초에서 14건/초로 떨어졌다(docs/troubleshooting.md).
+
+    예약은 최대 MAX_DURATION(8시간)이므로, 겹치는 예약은 반드시
+    start_at > (찾는 구간의 시작 - 8시간)이다. 이 하한을 넣어 읽는 범위를 8시간 안으로 줄인다.
+    상한은 입력 검증과 DB CHECK 제약(ck_reservations_duration)이 함께 보장한다.
+    """
+    return [
+        Reservation.start_at > start_at - MAX_DURATION,
+        Reservation.start_at < end_at,
+        Reservation.end_at > start_at,
+    ]
+
+
 def _ensure_reservable(db: Session, resource: Resource | None) -> None:
     if resource is None:
         db.rollback()
@@ -207,8 +253,7 @@ def list_resource_schedule(db: Session, resource_id: int, day: date) -> list[Res
             .where(
                 Reservation.resource_id == resource_id,
                 Reservation.status == ReservationStatus.CONFIRMED,
-                Reservation.start_at < day_end,
-                Reservation.end_at > day_start,
+                *_overlap_conditions(day_start, day_end),
             )
             .order_by(Reservation.start_at)
         ).all()

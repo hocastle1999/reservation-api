@@ -20,6 +20,9 @@ NOT_FOUND = {status.HTTP_404_NOT_FOUND: {"description": "예약이 없거나 내
         **UNAUTHORIZED,
         status.HTTP_404_NOT_FOUND: {"description": "자원이 없음"},
         status.HTTP_409_CONFLICT: {"description": "겹치는 예약이 있거나 비활성 자원"},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "description": "요청이 몰려 데드락이 반복됨. 잠시 후 다시 시도하면 된다"
+        },
     },
     summary="예약 생성",
     description=(

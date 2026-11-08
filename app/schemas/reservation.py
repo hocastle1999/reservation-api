@@ -14,10 +14,7 @@ from pydantic import (
 )
 
 from app.core.time import to_kst, to_utc_naive, utc_now
-from app.models import SLOT_MINUTES, ReservationStatus
-
-MAX_DURATION_HOURS = 8
-MAX_DURATION = dt.timedelta(hours=MAX_DURATION_HOURS)
+from app.models import MAX_DURATION, MAX_DURATION_HOURS, SLOT_MINUTES, ReservationStatus
 
 Purpose = Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
 

@@ -1,9 +1,12 @@
 from datetime import datetime
 
+import pymysql
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 
 from app.models import Reservation, ReservationSlot, ReservationStatus, Resource
+from app.services import reservation_service
 from tests.conftest import auth_header, make_user
 
 # 이 파일의 모든 테스트를 방법 A(lock)와 방법 B(slot)로 한 번씩 실행한다.
@@ -83,6 +86,84 @@ def test_slot_boundary_is_checked_in_utc(client, resource):
 
 def test_create_allows_max_duration(client, resource):
     assert reserve(client, resource.id, kst("09:00"), kst("17:00")).status_code == 201
+
+
+def test_overlap_with_max_length_reservation_is_found(client, resource):
+    # 겹침 검사는 "시작 - 8시간" 하한으로 검색 범위를 줄인다. 하한 바로 안쪽에서 시작한
+    # 가장 긴(8시간) 예약도 찾아야 한다.
+    assert reserve(client, resource.id, kst("02:00"), kst("10:00")).status_code == 201
+
+    assert reserve(client, resource.id, kst("09:30"), kst("10:30")).status_code == 409
+
+
+def test_db_rejects_reservation_longer_than_max_duration(db_session, resource, user):
+    # API를 거치지 않고 넣어도 DB CHECK 제약이 8시간 초과를 막는다.
+    db_session.add(
+        Reservation(
+            resource_id=resource.id,
+            user_id=user.id,
+            start_at=datetime(2030, 1, 7, 0, 0),
+            end_at=datetime(2030, 1, 7, 8, 30),
+        )
+    )
+    # PyMySQL은 CHECK 위반(3819)을 IntegrityError가 아니라 OperationalError로 올린다.
+    with pytest.raises(OperationalError) as info:
+        db_session.commit()
+    db_session.rollback()
+    assert info.value.orig.args[0] == 3819  # Check constraint ... is violated
+
+
+# --- 데드락 재시도 ------------------------------------------------------------
+
+
+def deadlock_error() -> OperationalError:
+    return OperationalError(
+        "INSERT ...",
+        {},
+        pymysql.err.OperationalError(1213, "Deadlock found when trying to get lock"),
+    )
+
+
+@pytest.fixture
+def flaky_create(monkeypatch, reservation_strategy):
+    """방식별 생성 함수를 처음 failures번은 데드락을 내는 가짜로 바꾼다. 호출 횟수를 돌려준다."""
+    name = "_create_with_slots" if reservation_strategy == "slot" else "_create_with_lock"
+    original = getattr(reservation_service, name)
+    calls = {"count": 0}
+
+    def install(failures: int) -> dict[str, int]:
+        def fake(db, user, data):
+            calls["count"] += 1
+            if calls["count"] <= failures:
+                raise deadlock_error()
+            return original(db, user, data)
+
+        monkeypatch.setattr(reservation_service, name, fake)
+        return calls
+
+    return install
+
+
+def test_create_retries_after_deadlock(client, resource, flaky_create):
+    calls = flaky_create(failures=2)
+
+    response = reserve(client, resource.id, kst("10:00"), kst("11:00"))
+
+    assert response.status_code == 201
+    assert calls["count"] == 3
+
+
+def test_create_gives_up_after_repeated_deadlocks(client, resource, db_session, flaky_create):
+    calls = flaky_create(failures=3)
+
+    response = reserve(client, resource.id, kst("10:00"), kst("11:00"))
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "요청이 몰려 예약을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요."
+    }
+    assert calls["count"] == 3
+    assert db_session.scalar(select(func.count()).select_from(Reservation)) == 0
 
 
 def test_slots_are_stored_only_by_slot_strategy(client, resource, db_session, reservation_strategy):

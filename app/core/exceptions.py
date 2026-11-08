@@ -37,6 +37,12 @@ class ConflictError(AppError):
     status_code = 409
 
 
+class ServiceUnavailableError(AppError):
+    """일시적으로 처리하지 못함. 같은 요청을 잠시 뒤 다시 보내면 성공할 수 있다."""
+
+    status_code = 503
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:

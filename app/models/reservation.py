@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import BigInteger, CheckConstraint, DateTime, Enum, ForeignKey, Index, String
@@ -19,10 +19,23 @@ class ReservationStatus(enum.StrEnum):
     CANCELLED = "CANCELLED"
 
 
+# 예약 하나의 최대 길이. 입력 검증(app/schemas/reservation.py)과 아래 CHECK 제약이 함께 쓴다.
+# 겹침 검사와 일정 조회 쿼리도 이 상한을 전제로 검색 범위를 줄인다
+# (reservation_service). 값을 바꾸면 CHECK 제약 마이그레이션도 새로 만들어야 한다.
+MAX_DURATION_HOURS = 8
+MAX_DURATION = timedelta(hours=MAX_DURATION_HOURS)
+
+
 class Reservation(TimestampMixin, Base):
     __tablename__ = "reservations"
     __table_args__ = (
         CheckConstraint("start_at < end_at", name="time"),
+        # 앱 검증만 믿지 않고 DB에서도 막는다. SQL로 직접 넣은 행이 상한을 넘으면
+        # 겹침 검사의 검색 범위 축소가 틀린 결과를 낸다(겹치는 예약을 못 찾음).
+        CheckConstraint(
+            f"TIMESTAMPDIFF(MINUTE, start_at, end_at) <= {MAX_DURATION_HOURS * 60}",
+            name="duration",
+        ),
         # 겹침 검사("이 자원의 이 시간대")와 자원별 예약 목록 조회용.
         # 자원으로 먼저 좁힌 뒤 시간 범위를 보므로 resource_id가 앞에 온다.
         Index("ix_reservations_resource_start", "resource_id", "start_at"),
