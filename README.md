@@ -24,7 +24,7 @@
 - [x] 같은 시간대 중복 예약 방지 (동시 요청 상황 포함, 비관적 락)
 - [x] 다른 방식(시간 칸 + 기본키)으로 구현해 같은 테스트로 검증
 - [x] 두 방식의 부하 측정 (처리량, 응답 시간, 데드락)
-- [ ] 배포
+- [ ] 배포 (설정 준비 완료, Render + Aiven MySQL)
 
 ## API
 
@@ -132,6 +132,43 @@ Copy-Item .env.example .env
 - 테스트마다 트랜잭션을 열고 끝나면 롤백합니다. 그래서 테스트끼리 데이터가 섞이지 않습니다.
 - GitHub Actions에서는 MySQL 8.0 컨테이너를 함께 띄워 같은 테스트를 실행합니다.
 
+## 배포
+
+앱은 [Render](https://render.com) 무료 웹 서비스, DB는 [Aiven](https://aiven.io) 무료 MySQL 8.0에 둡니다. 설정은 저장소의 `render.yaml`(Render Blueprint)에 있습니다.
+
+**왜 이렇게 나눴나**: Render의 관리형 DB는 PostgreSQL뿐입니다. 이 앱은 MySQL의 락 동작(`FOR UPDATE`, 중복 키 락)과 오류 번호(1062, 1213, 3819)에 기대기 때문에, 진짜 MySQL이 필요합니다.
+
+### 처음 배포하는 순서
+
+1. **Aiven에서 MySQL 만들기**
+   - 무료 플랜으로 MySQL 서비스를 만듭니다. Render 서비스(싱가포르)와 가까운 리전을 고르면 지연이 줄어듭니다.
+   - 서비스 화면의 *Databases*에서 `reservation` 데이터베이스를 만듭니다.
+   - *Overview*에서 Host, Port, User, Password를 확인하고, **CA certificate**를 내려받습니다.
+2. **Render에서 Blueprint로 만들기**
+   - *New → Blueprint*에서 이 저장소를 고르면 `render.yaml`을 읽습니다.
+   - `DB_HOST`, `DB_PORT`, `DB_NAME`(`reservation`), `DB_USER`, `DB_PASSWORD`를 입력합니다. `JWT_SECRET_KEY`는 Render가 무작위로 만듭니다.
+3. **CA 인증서 올리기**
+   - 서비스의 *Environment → Secret Files*에 파일 이름 `aiven-ca.pem`으로 CA 인증서 내용을 붙여 넣습니다(`/etc/secrets/aiven-ca.pem`).
+   - 2단계에서 바로 시작된 첫 배포는 인증서가 없어서 실패할 수 있습니다. 인증서를 저장하면 다시 배포됩니다.
+4. **관리자 계정 만들기**: 무료 플랜은 서버 셸에 들어갈 수 없습니다. 그래서 내 PC에서 운영 DB에 직접 접속해 만듭니다. 이 명령은 `.env` 대신 현재 창의 환경 변수를 씁니다(환경 변수가 `.env`보다 우선).
+
+   ```powershell
+   $env:DB_HOST="<Aiven Host>"; $env:DB_PORT="<Port>"; $env:DB_NAME="reservation"
+   $env:DB_USER="<User>"; $env:DB_PASSWORD="<Password>"; $env:DB_SSL_CA="C:\path\to\ca.pem"
+   .\.venv\Scripts\python.exe -m app.cli create-admin --email admin@example.com --name 관리자
+   ```
+
+5. **확인**: `https://<서비스 이름>.onrender.com/health/db`가 `{"status":"ok","database":"ok"}`이면 DB까지 연결된 것입니다. API 문서는 `/docs`에 있습니다.
+
+### 배포 설정에서 고민한 것
+
+- **마이그레이션은 시작 명령에서 실행합니다**(`alembic upgrade head && uvicorn ...`). 원래는 배포 직전 단계(`preDeployCommand`)가 맞는 자리지만, Render 무료 플랜에서는 쓸 수 없습니다. 인스턴스가 하나라 마이그레이션이 동시에 두 번 돌 일은 없습니다. 인스턴스를 늘리면 `preDeployCommand`로 옮겨야 합니다.
+- **DB 연결은 SSL과 인증서 검증을 함께 씁니다.** `DB_SSL_CA`를 지정하면 PyMySQL이 서버 인증서와 호스트 이름을 검증합니다. 로컬에서 확인해 보니 PyMySQL은 CA를 지정하지 않아도 서버가 지원하면 암호화는 하지만, 인증서는 검증하지 않았습니다. 그러면 중간에 가짜 서버가 끼어들어도 알 수 없습니다. 반대로 엉뚱한 CA를 지정하자 `CERTIFICATE_VERIFY_FAILED`로 접속이 거부되어, 검증이 실제로 동작하는 것도 확인했습니다.
+- **헬스 체크는 DB를 보지 않는 `/health`를 씁니다.** `/health/db`를 쓰면 DB가 잠깐 끊겨도 Render가 앱을 계속 재시작합니다.
+- **CI가 통과한 커밋만 배포합니다**(`autoDeployTrigger: checksPass`).
+- **Python 버전은 `.python-version`(3.11)으로 고정합니다.** Render의 기본값은 3.14라서, 고정하지 않으면 로컬, CI와 다른 버전으로 돕니다.
+- **무료 플랜의 제약**: 15분 동안 요청이 없으면 잠들고, 다음 요청 때 깨어나는 데 1분쯤 걸립니다. CPU가 0.1개라서 로그인(Argon2 해시)이 로컬보다 느릴 수 있습니다.
+
 ## 프로젝트 구조
 
 ```
@@ -140,7 +177,7 @@ app/
   core/config.py   환경 변수 설정
   db/session.py    DB 엔진과 세션
   db/base.py       ORM Base, 제약 이름 규칙
-  models/          ORM 모델 (users, resources, reservations)
+  models/          ORM 모델 (users, resources, reservations, reservation_slots)
   schemas/         요청과 응답 형식 (Pydantic)
   services/        비즈니스 로직 (HTTP와 무관)
   api/             기능별 라우터
@@ -150,8 +187,9 @@ app/
   cli.py           관리 명령 (관리자 계정 생성)
 migrations/        Alembic 마이그레이션
 tests/             pytest 테스트
-scripts/           DB와 계정 생성 SQL
+scripts/           DB와 계정 생성 SQL, 부하 측정 스크립트
 docs/              DB 설계, 문제 해결 기록
+render.yaml        Render 배포 설정 (Blueprint)
 ```
 
 ## 문제 해결 기록
